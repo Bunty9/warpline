@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Compiled WASM artifacts (cached AOT modules + guest builds)
+*.cwasm
+*.wasm
+
+# Per-tenant module cache written by warpline-control
+modules/
+
+# Environment + secrets
+.env
+.env.local
+.envrc
+
+# Editors / OS noise
+.idea/
+.vscode/
+.DS_Store

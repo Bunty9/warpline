@@ -1,0 +1,22 @@
+[package]
+name = "hello-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Minimal warpline guest module — returns the bytes 'hello from wasm'."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Intentionally no deps. This crate is built with
+# `cargo build --target wasm32-wasip1 --release` from inside this directory.
+# It is NOT part of the warpline workspace (the workspace root explicitly
+# excludes it) — see /Cargo.toml `exclude = ["examples/hello-wasm"]` for the
+# rationale (wasm32 target conflicts with the host-platform build graph).
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

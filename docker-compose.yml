@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: warpline
+      POSTGRES_PASSWORD: warpline
+      POSTGRES_DB: warpline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warpline -d warpline"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  warpline-host:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://warpline:warpline@postgres:5432/warpline
+      WARPLINE_HOST_BIND: 0.0.0.0:8080
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount migrations so the host container can run `sqlx migrate run` on
+      # boot if you wire that step into the entrypoint. The image already
+      # ships a copy under /app/migrations; this bind mount lets you iterate
+      # on schema changes without rebuilding.
+      - ./migrations:/app/migrations:ro
+    entrypoint: ["/usr/local/bin/warpline-host"]
+
+  warpline-control:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://warpline:warpline@postgres:5432/warpline
+      WARPLINE_CONTROL_BIND: 0.0.0.0:8081
+      WARPLINE_MODULES_DIR: /var/lib/warpline/modules
+      RUST_LOG: info
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./migrations:/app/migrations:ro
+      - modules_data:/var/lib/warpline/modules
+    entrypoint: ["/usr/local/bin/warpline-control"]
+
+volumes:
+  postgres_data:
+  minio_data:
+  modules_data:
