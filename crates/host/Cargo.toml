@@ -17,7 +17,7 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true }
+reqwest = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

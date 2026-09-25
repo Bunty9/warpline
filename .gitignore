@@ -6,6 +6,9 @@ Cargo.lock.bak
 # Compiled WASM artifacts (cached AOT modules + guest builds)
 *.cwasm
 *.wasm
+# ...except the committed test fixture built by scripts/build-guests.sh —
+# cargo test -p warpline-core needs it without the wasm32-wasip2 target.
+!crates/core/tests/fixtures/*.wasm
 
 # Per-tenant module cache written by warpline-control
 modules/

@@ -5,18 +5,20 @@ members = [
     "crates/host",
     "crates/control",
 ]
-# `examples/hello-wasm` is intentionally NOT a workspace member: it targets
-# `wasm32-wasip1` and would conflict with the host-platform build graph (its
-# deps are different and it has its own `Cargo.lock`). Build it directly with
-# `cargo build --target wasm32-wasip1 --release` from inside that directory.
+# `examples/hello-wasm` and `examples/test-guest` are intentionally NOT
+# workspace members: they target `wasm32-wasip2` and would conflict with the
+# host-platform build graph (different deps, own `Cargo.lock`). Build them
+# directly with `scripts/build-guests.sh` or `cargo build --target
+# wasm32-wasip2 --release` from inside each directory.
 exclude = [
     "examples/hello-wasm",
+    "examples/test-guest",
 ]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-rust-version = "1.78"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -29,11 +31,12 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 # Postgres for tenant + metering tables.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros"] }
 
-# WASM runtime. Features cover async invocation, cranelift codegen, parallel
-# compilation of large module sets, and the WASI Component-Model surface that
-# `wit-bindgen` targets.
-wasmtime = { version = "27", features = ["async", "cranelift", "parallel-compilation", "component-model"] }
-wasmtime-wasi = "27"
+# WASM runtime. `default-features = false` because upstream defaults now pull
+# in gc/pooling-allocator/wit-parser/wat/cache/etc that this host never uses;
+# the explicit feature list is the minimum `bindgen!` + async component
+# instantiation + parallel cranelift compilation need.
+wasmtime = { version = "49", default-features = false, features = ["async", "cranelift", "parallel-compilation", "component-model", "anyhow"] }
+wasmtime-wasi = { version = "49", default-features = false, features = ["p2"] }
 
 # Async trait objects for the KvStore abstraction in `core::kv`.
 async-trait = "0.1"
@@ -42,8 +45,7 @@ async-trait = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 
-# Outbound HTTP for the host-side `http-out` capability (TODO behind a stub
-# in Phase 1; see crates/core/src/runtime.rs).
+# Outbound HTTP for the host-side `http-out` capability.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
 
@@ -59,7 +61,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 # Multipart upload parsing in `warpline-control`.
 bytes = "1"

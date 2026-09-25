@@ -9,14 +9,16 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
-# Intentionally no deps. This crate is built with
-# `cargo build --target wasm32-wasip1 --release` from inside this directory.
-# It is NOT part of the warpline workspace (the workspace root explicitly
-# excludes it) — see /Cargo.toml `exclude = ["examples/hello-wasm"]` for the
-# rationale (wasm32 target conflicts with the host-platform build graph).
+# This crate is built with `cargo build --target wasm32-wasip2 --release`
+# from inside this directory (or via `scripts/build-guests.sh`). It is NOT
+# part of the warpline workspace (the workspace root explicitly excludes
+# it) — see /Cargo.toml `exclude` for the rationale (the wasm32 target
+# conflicts with the host-platform build graph).
 [dependencies]
+wit-bindgen = "0.62"
 
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
+strip = true

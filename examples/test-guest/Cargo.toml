@@ -1,0 +1,22 @@
+[package]
+name = "test-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "warpline-core integration-test fixture — dispatches on its input to exercise every host capability, cap, and trap path."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Built with `cargo build --target wasm32-wasip2 --release` (or
+# `scripts/build-guests.sh`), same as `examples/hello-wasm` — see that
+# crate's README for why this isn't a workspace member.
+[dependencies]
+wit-bindgen = "0.62"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
