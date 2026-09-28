@@ -15,18 +15,6 @@ services:
       timeout: 2s
       retries: 20
 
-  minio:
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-
   warpline-host:
     build: .
     depends_on:
@@ -35,6 +23,7 @@ services:
     environment:
       DATABASE_URL: postgres://warpline:warpline@postgres:5432/warpline
       WARPLINE_HOST_BIND: 0.0.0.0:8080
+      WARPLINE_MODULES_DIR: /var/lib/warpline/modules
       RUST_LOG: info
     ports:
       - "8080:8080"
@@ -44,6 +33,9 @@ services:
       # ships a copy under /app/migrations; this bind mount lets you iterate
       # on schema changes without rebuilding.
       - ./migrations:/app/migrations:ro
+      # Shared with warpline-control — the host reads `.cwasm`s and pointer
+      # files the control plane writes; see `warpline_core::registry`.
+      - modules_data:/var/lib/warpline/modules
     entrypoint: ["/usr/local/bin/warpline-host"]
 
   warpline-control:
@@ -55,6 +47,10 @@ services:
       DATABASE_URL: postgres://warpline:warpline@postgres:5432/warpline
       WARPLINE_CONTROL_BIND: 0.0.0.0:8081
       WARPLINE_MODULES_DIR: /var/lib/warpline/modules
+      # Placeholder — replace before any non-local deployment. Bearer token
+      # for POST /admin/tenants/{tenant}; unset (or empty) disables the
+      # route entirely (404). See `warpline_control::AppState::new`.
+      WARPLINE_ADMIN_TOKEN: change-me
       RUST_LOG: info
     ports:
       - "8081:8081"
@@ -65,5 +61,4 @@ services:
 
 volumes:
   postgres_data:
-  minio_data:
   modules_data:

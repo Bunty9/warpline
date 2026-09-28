@@ -284,6 +284,22 @@ pub fn build_linker(engine: &Engine) -> anyhow::Result<Linker<HostCtx>> {
     Ok(linker)
 }
 
+/// Type-check `component` against `linker` — every import the component
+/// declares must be satisfiable by what `linker` provides (WASI p2 plus the
+/// `warpline:host` capability surface) and it must export `handle` with the
+/// right signature. Used by `warpline-control` at upload time so a
+/// component that imports something we don't provide is rejected with a
+/// 422 there, rather than failing to instantiate on its first invoke.
+///
+/// `linker.instantiate_pre` alone already checks every import; wrapping the
+/// result in [`HandlerPre::new`] additionally checks the `handle` export,
+/// which `instantiate_pre` doesn't look at.
+pub fn typecheck_component(linker: &Linker<HostCtx>, component: &Component) -> anyhow::Result<()> {
+    let instance_pre = linker.instantiate_pre(component)?;
+    HandlerPre::new(instance_pre)?;
+    Ok(())
+}
+
 /// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8
 /// character.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {

@@ -1,0 +1,185 @@
+//! Dev-mode (no `DATABASE_URL`) end-to-end tests: upload through the real
+//! `warpline-control` router into a tempdir modules dir, then invoke
+//! through `warpline-host`'s router against that same dir — exercising the
+//! registry pointer-file handoff between the two binaries without a real
+//! Postgres or a real listening socket.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
+use warpline_core::auth::DbState;
+use warpline_core::kv::MemKv;
+use warpline_core::registry::ComponentCache;
+use warpline_core::runtime::{build_engine, build_http_client, build_linker, EpochTicker};
+
+const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/tests/fixtures/test_guest.wasm"
+));
+
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn multipart_body(field_name: &str, content: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "warpline-test-boundary-7f3e9a";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{field_name}\"; filename=\"m.wasm\"\r\n\
+             Content-Type: application/wasm\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(content);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn control_router(
+    engine: wasmtime::Engine,
+    linker: wasmtime::component::Linker<warpline_core::types::HostCtx>,
+    modules_dir: &Path,
+) -> axum::Router {
+    let state = warpline_control::AppState::new(
+        engine,
+        linker,
+        modules_dir.to_path_buf(),
+        DbState::InsecureDev,
+    );
+    warpline_control::router(state)
+}
+
+fn host_router(
+    engine: wasmtime::Engine,
+    linker: wasmtime::component::Linker<warpline_core::types::HostCtx>,
+    modules_dir: &Path,
+    ticker: EpochTicker,
+) -> axum::Router {
+    let state = warpline_host::AppState {
+        engine,
+        linker,
+        modules_dir: modules_dir.to_path_buf(),
+        component_cache: Arc::new(ComponentCache::new()),
+        kv: Arc::new(MemKv::new()),
+        http_client: build_http_client(true).expect("build http client"),
+        allow_private_egress: false,
+        db: DbState::InsecureDev,
+        metrics_handle: warpline_host::metrics_handle(),
+        ticker: Arc::new(ticker),
+    };
+    warpline_host::router(state)
+}
+
+async fn upload(
+    router: &axum::Router,
+    tenant: &str,
+    func: &str,
+    wasm: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let (content_type, body) = multipart_body("wasm", wasm);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/tenants/{tenant}/functions/{func}"))
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), MAX_RESPONSE_BYTES)
+        .await
+        .unwrap();
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    };
+    (status, json)
+}
+
+async fn invoke(
+    router: &axum::Router,
+    tenant: &str,
+    func: &str,
+    body: &[u8],
+) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/tenants/{tenant}/functions/{func}/invoke"))
+        .body(Body::from(body.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), MAX_RESPONSE_BYTES)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Everything in one test (rather than N tests each paying for their own
+/// `Engine`/`Component` build) since every scenario shares the same
+/// uploaded module and modules dir.
+#[tokio::test]
+async fn upload_then_invoke_end_to_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = build_engine().expect("build engine");
+
+    let control = control_router(engine.clone(), build_linker(&engine).unwrap(), dir.path());
+    let ticker = EpochTicker::spawn(engine.clone());
+    let host = host_router(
+        engine.clone(),
+        build_linker(&engine).unwrap(),
+        dir.path(),
+        ticker,
+    );
+
+    // Invalid names -> 400, on both routers. ("Bad-Name" is a valid URI
+    // path segment but fails `valid_name`'s lowercase-only rule.)
+    let (status, _) = upload(&control, "Bad-Name", "f", TEST_GUEST_WASM).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = invoke(&host, "Bad-Name", "f", b"x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown function -> 404.
+    let (status, _) = invoke(&host, "acme", "nope", b"x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Non-component bytes -> rejected with a 4xx (compile failure).
+    let (status, _) = upload(&control, "acme", "garbage", b"not a wasm component").await;
+    assert!(status.is_client_error(), "got {status}");
+
+    // Successful upload -> 201, digest matches the source hash.
+    let (status, json) = upload(&control, "acme", "echo", TEST_GUEST_WASM).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let expected_digest = warpline_core::cache::digest(TEST_GUEST_WASM);
+    assert_eq!(json["digest"], expected_digest);
+
+    // Invoke the freshly uploaded function -> 200, echoed body.
+    let (status, body) = invoke(&host, "acme", "echo", b"hello there").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, b"hello there");
+
+    // Re-upload (same bytes) works and doesn't break the pointer.
+    let (status, _) = upload(&control, "acme", "echo", TEST_GUEST_WASM).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = invoke(&host, "acme", "echo", b"still here").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"still here");
+
+    // Oversized upload (> 16 MiB) -> 413.
+    let big = vec![0u8; 16 * 1024 * 1024 + 4096];
+    let (status, _) = upload(&control, "acme", "big", &big).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // CPU loop -> 408 (dev-mode default cpu_budget_ms = 100).
+    let (status, body) = invoke(&host, "acme", "echo", b"loop").await;
+    assert_eq!(
+        status,
+        StatusCode::REQUEST_TIMEOUT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}

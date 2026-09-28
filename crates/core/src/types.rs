@@ -31,6 +31,63 @@ pub fn valid_name(s: &str) -> bool {
     is_head(bytes[0]) && bytes[1..].iter().all(|&b| is_tail(b))
 }
 
+/// Valid range for a tenant's `cpu_budget_ms`, milliseconds — mirrored by
+/// the `CHECK` constraint on `tenants.cpu_budget_ms` in
+/// `migrations/0002_auth_config.sql`.
+pub const MIN_CPU_BUDGET_MS: i64 = 1;
+pub const MAX_CPU_BUDGET_MS: i64 = 10_000;
+/// Valid range for a tenant's `mem_cap_bytes` — mirrored by the `CHECK`
+/// constraint on `tenants.mem_cap_bytes`.
+pub const MIN_MEM_CAP_BYTES: i64 = 1024 * 1024;
+pub const MAX_MEM_CAP_BYTES: i64 = 512 * 1024 * 1024;
+/// Max `allowed_hosts` entries a tenant config may set.
+pub const MAX_ALLOWED_HOSTS: usize = 64;
+
+/// A tenant config value submitted to `warpline-control`'s admin route
+/// failed validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("cpu_budget_ms must be between {MIN_CPU_BUDGET_MS} and {MAX_CPU_BUDGET_MS}")]
+    CpuBudgetRange,
+    #[error("mem_cap_bytes must be between {MIN_MEM_CAP_BYTES} and {MAX_MEM_CAP_BYTES}")]
+    MemCapRange,
+    #[error("allowed_hosts must have at most {MAX_ALLOWED_HOSTS} entries")]
+    TooManyHosts,
+    #[error("invalid hostname: {0}")]
+    InvalidHost(String),
+}
+
+pub fn validate_cpu_budget_ms(v: i64) -> Result<(), ConfigError> {
+    if (MIN_CPU_BUDGET_MS..=MAX_CPU_BUDGET_MS).contains(&v) {
+        Ok(())
+    } else {
+        Err(ConfigError::CpuBudgetRange)
+    }
+}
+
+pub fn validate_mem_cap_bytes(v: i64) -> Result<(), ConfigError> {
+    if (MIN_MEM_CAP_BYTES..=MAX_MEM_CAP_BYTES).contains(&v) {
+        Ok(())
+    } else {
+        Err(ConfigError::MemCapRange)
+    }
+}
+
+/// A "plausible hostname" is anything `url::Host::parse` accepts — a
+/// domain name or an IP literal, both of which `http-out::fetch`'s
+/// allowlist check (`runtime::http_fetch`) compares against verbatim.
+pub fn validate_allowed_hosts(hosts: &[String]) -> Result<(), ConfigError> {
+    if hosts.len() > MAX_ALLOWED_HOSTS {
+        return Err(ConfigError::TooManyHosts);
+    }
+    for h in hosts {
+        if url::Host::parse(h).is_err() {
+            return Err(ConfigError::InvalidHost(h.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// Per-invocation host context. See module docs.
 pub struct HostCtx {
     pub tenant_id: String,
@@ -224,7 +281,28 @@ impl wasmtime::ResourceLimiter for TenantLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_name;
+    use super::{
+        valid_name, validate_allowed_hosts, validate_cpu_budget_ms, validate_mem_cap_bytes,
+    };
+
+    #[test]
+    fn config_validators_accept_boundary_values_and_reject_outside_them() {
+        assert!(validate_cpu_budget_ms(1).is_ok());
+        assert!(validate_cpu_budget_ms(10_000).is_ok());
+        assert!(validate_cpu_budget_ms(0).is_err());
+        assert!(validate_cpu_budget_ms(10_001).is_err());
+
+        assert!(validate_mem_cap_bytes(1024 * 1024).is_ok());
+        assert!(validate_mem_cap_bytes(512 * 1024 * 1024).is_ok());
+        assert!(validate_mem_cap_bytes(1024 * 1024 - 1).is_err());
+        assert!(validate_mem_cap_bytes(512 * 1024 * 1024 + 1).is_err());
+
+        assert!(
+            validate_allowed_hosts(&["example.com".to_string(), "127.0.0.1".to_string()]).is_ok()
+        );
+        assert!(validate_allowed_hosts(&["not a host".to_string()]).is_err());
+        assert!(validate_allowed_hosts(&vec!["a.com".to_string(); 65]).is_err());
+    }
 
     #[test]
     fn valid_name_accepts_expected_shapes() {

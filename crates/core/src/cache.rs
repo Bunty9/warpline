@@ -85,8 +85,10 @@ fn compat_hash(engine: &Engine) -> String {
 
 /// Returns true iff `s` is exactly 64 lowercase hex characters — the shape
 /// of a SHA-256 digest as produced by [`digest`]. See module docs for why
-/// [`load_cwasm`] checks this before touching the filesystem.
-fn is_valid_digest(s: &str) -> bool {
+/// [`load_cwasm`] checks this before touching the filesystem. `pub(crate)`
+/// so `crate::registry` can apply the same check to pointer-file contents
+/// before it ever builds a path out of them.
+pub(crate) fn is_valid_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
