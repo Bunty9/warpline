@@ -2,12 +2,19 @@
 
 > Multi-tenant WASM function runtime in Rust. Wasmtime 49 Component Model
 > host + control plane, epoch-based CPU caps, content-addressed `.cwasm`
-> warm cache, deny-by-default outbound HTTP. Built as the cloud-runtime
-> portfolio project for the Rust Level-4 roadmap — the Cloudflare Workers /
-> Fastly Compute / Fermyon Spin pattern, scoped to one box and ten clients.
+> warm cache, deny-by-default outbound HTTP. The Cloudflare Workers /
+> Fastly Compute / Fermyon Spin pattern, sized for a single box.
 
 [![ci](https://github.com/Bunty9/warpline/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/warpline/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/warpline-core.svg)](https://crates.io/crates/warpline-core)
+[![docs.rs](https://docs.rs/warpline-core/badge.svg)](https://docs.rs/warpline-core)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+| Crate | What it is |
+| --- | --- |
+| [`warpline-core`](https://crates.io/crates/warpline-core) | Library: sandboxed runtime, host bindings, caps, registry, auth, metering |
+| [`warpline-host`](https://crates.io/crates/warpline-host) | Binary: invoke server (`cargo install warpline-host`) |
+| [`warpline-control`](https://crates.io/crates/warpline-control) | Binary: upload + admin API (`cargo install warpline-control`) |
 
 ## The problem
 
@@ -15,10 +22,9 @@ Customer-customization is a recurring need in any SaaS or agency product —
 clients want hooks into automation flows. Today this usually means "open a
 PR and redeploy." A WASM function host lets clients upload sandboxed code
 in any language that compiles to WASI, with real resource caps and a
-metered capability surface. **warpline** is that host, sized to embed into
-a real customer pilot on one box, with the engineering defenses (cwasm
-cache, epoch CPU caps, http-out allowlist) the interview panels want to
-talk about.
+metered capability surface. **warpline** is that host, sized to run a
+real customer pilot on one box: precompiled-module cache, epoch-based CPU
+caps, memory limits and an outbound-HTTP allowlist.
 
 ## Architecture
 
@@ -371,8 +377,7 @@ Measured via `cargo bench -p warpline-core`
 (`crates/core/benches/{runtime,report}.rs`) on an 8-core Intel i5-9300H
 laptop against the `test_guest.wasm` fixture (trivial echo/loop/alloc
 handler, not representative of real tenant code). Full numbers,
-methodology, and caveats are in
-[`PROGRESS.md`](./PROGRESS.md#bench-numbers-targets-per-projects-l3-l4md--p6-updated-weekly).
+methodology, and caveats are in [`PROGRESS.md`](./PROGRESS.md).
 
 | Metric                                   | Target        | Result                              |
 | ------------------------------------------ | --------------- | -------------------------------------- |
@@ -449,7 +454,7 @@ Out of scope for the current runtime, tracked for a later phase:
   every invoke currently builds a fresh `Store`.
 - **Single-flight dedupe on a cold digest** — a burst of concurrent
   first-invokes for one freshly-uploaded function each pay for their own
-  `.cwasm` recompile today (`ponytail:` note in
+  `.cwasm` recompile today (see `ComponentCache` in
   `crates/core/src/registry.rs`); a per-digest in-flight map would fix that
   if it shows up as real load.
 - **Hyperlight** — sub-millisecond ephemeral instances (Microsoft, Mar

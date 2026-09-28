@@ -7,7 +7,7 @@
 //!
 //! [`authenticate`] is on the hot path of every request (host invoke *and*
 //! control upload), so every bearer token hits a process-local, bounded TTL
-//! cache ([`AUTH_CACHE`]) before it ever touches Postgres — both a valid
+//! cache (`AUTH_CACHE`) before it ever touches Postgres — both a valid
 //! key's outcome and an unknown key's absence are cached, so a client
 //! hammering a bad token can't turn into a pool-exhausting query storm
 //! either. **Consequence: a config change or key revocation can take up to

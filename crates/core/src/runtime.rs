@@ -23,8 +23,8 @@
 //!   the worker thread — other tasks (other tenants' invocations, the
 //!   ticker itself) keep making progress. Once the callback has been
 //!   called `budget_ticks` times it returns a distinguishable
-//!   [`CpuBudgetExceededMarker`] error instead of extending the deadline
-//!   again, which [`classify_trap`] downcasts to `InvokeError::CpuBudgetExceeded`.
+//!   `CpuBudgetExceededMarker` error instead of extending the deadline
+//!   again, which `classify_trap` downcasts to `InvokeError::CpuBudgetExceeded`.
 //!   A single background thread ([`EpochTicker`]) bumps the engine-wide
 //!   epoch every [`EPOCH_TICK_MS`]; each store's deadline is set in ticks.
 //!   This replaced a Phase-1 per-call `tokio::spawn` ticker that bumped the
@@ -60,7 +60,7 @@ const MAX_KV_VALUE_BYTES: usize = 1024 * 1024;
 /// unbounded host-memory growth from a guest that puts in a tight loop.
 pub const MAX_KV_PUTS_PER_INVOCATION: usize = 1000;
 /// Max total `kv::put` value bytes per invocation — exceeding it traps the
-/// guest, independent of the per-call [`MAX_KV_VALUE_BYTES`] cap.
+/// guest, independent of the per-call `MAX_KV_VALUE_BYTES` cap.
 pub const MAX_KV_PUT_BYTES_PER_INVOCATION: usize = 8 * 1024 * 1024;
 /// `log::emit` messages are truncated (not trapped) at this many bytes.
 const MAX_LOG_MSG_BYTES: usize = 4 * 1024;
@@ -186,10 +186,10 @@ impl reqwest::dns::Resolve for GuardedResolver {
 ///
 /// - `redirect::Policy::none()` — redirects could otherwise walk a request
 ///   from an allowlisted host to a non-allowlisted one; the allowlist check
-///   in [`http_fetch`] only ever sees the first hop.
+///   in `http_fetch` only ever sees the first hop.
 /// - a blanket 5 s timeout so a slow upstream can't pin a tenant's request
 ///   open indefinitely.
-/// - a [`GuardedResolver`] that, when `allow_private` is `false`, refuses
+/// - a `GuardedResolver` that, when `allow_private` is `false`, refuses
 ///   to hand back loopback/private/link-local/etc. addresses — see
 ///   [`is_blocked_ip`]. Callers that need to reach `127.0.0.1` (tests
 ///   standing up local servers) pass `true`.
@@ -301,7 +301,7 @@ pub fn build_linker(engine: &Engine) -> anyhow::Result<Linker<HostCtx>> {
 /// Build the pre-instantiated [`HandlerPre`] for `component` against
 /// `linker` — every import check and the `handle`-export check that
 /// `instantiate_async` would otherwise redo on *every* invoke, done once
-/// here instead. [`registry::ComponentCache`] calls this once per loaded
+/// here instead. [`registry::ComponentCache`](crate::registry::ComponentCache) calls this once per loaded
 /// component and caches the result; [`invoke`] takes the cached
 /// `HandlerPre` rather than a bare `Component` + `Linker` pair so a warm
 /// invoke's `instantiate_async` skips straight to instance creation.
@@ -587,7 +587,7 @@ fn classify_trap(err: wasmtime::Error, store: &Store<HostCtx>, budget_ms: u64) -
 /// fresh [`Store`] carrying `ctx`.
 ///
 /// `pre` is a [`HandlerPre`] built once (by [`instantiate_pre`], via
-/// [`registry::ComponentCache`]) rather than a bare `Component` + `Linker`
+/// [`registry::ComponentCache`](crate::registry::ComponentCache)) rather than a bare `Component` + `Linker`
 /// pair — `pre.instantiate_async` below skips the import/export type-check
 /// `Handler::instantiate_async(store, component, linker)` would otherwise
 /// redo on every single call.

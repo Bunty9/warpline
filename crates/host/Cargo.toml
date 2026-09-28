@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 readme = "../../README.md"
+# Integration tests read the fixture from crates/core, which isn't in
+# this package; ship without them rather than with tests that don't build.
+exclude = ["tests/"]
 
 [[bin]]
 name = "warpline-host"

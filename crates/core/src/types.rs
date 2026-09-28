@@ -214,7 +214,7 @@ pub struct TenantLimiter {
     /// Sum of `desired - current` over every accepted `memory_growing` call
     /// — the combined size of every core memory in the store.
     total_bytes: usize,
-    /// High-water mark of [`Self::total_bytes`].
+    /// High-water mark of `Self::total_bytes`.
     pub peak_bytes: usize,
     /// Set once `memory_growing` rejects a request — lets `invoke`
     /// distinguish "guest hit the memory cap" from any other trap.

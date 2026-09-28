@@ -152,7 +152,7 @@ struct ComponentCacheInner {
     total_bytes: usize,
 }
 
-/// In-memory LRU of loaded [`Component`]s keyed by content digest, so a
+/// In-memory LRU of loaded [`Component`](wasmtime::component::Component)s keyed by content digest, so a
 /// warm invoke (whose pointer resolves to a digest this cache already
 /// holds) skips `Component::deserialize` entirely. A miss falls through to
 /// [`cache::load_cwasm`] against `modules_dir`'s shared `cwasm/` directory,

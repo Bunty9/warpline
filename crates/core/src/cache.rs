@@ -179,7 +179,7 @@ pub fn compile(
 }
 
 /// Serialize `component` and publish it to `cache_dir/{digest}-{compat}.cwasm`
-/// (atomically — see [`atomic_write`]). Split out of [`load_or_compile`] so
+/// (atomically — see `atomic_write`). Split out of [`load_or_compile`] so
 /// callers that must not persist an unchecked component (see [`compile`])
 /// can typecheck first.
 ///

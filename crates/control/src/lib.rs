@@ -9,7 +9,7 @@
 //!   rejected here rather than at invoke time, and only *then* persists the
 //!   source `.wasm` + compiled `.cwasm` and publishes the `(tenant, func)`
 //!   pointer — in DB mode, inside one transaction that also enforces the
-//!   per-tenant function quota (see [`publish_pointer`]).
+//!   per-tenant function quota (see `publish_pointer`).
 //! - `POST /admin/tenants/{tenant}` (guarded by `WARPLINE_ADMIN_TOKEN`)
 //!   creates a tenant idempotently, optionally sets its resource config,
 //!   and issues a new API key — tenant upsert, config update and key insert
@@ -69,7 +69,7 @@ pub struct AppState {
     /// number of full cranelift passes at once.
     pub compile_semaphore: Arc<Semaphore>,
     /// Per-tenant cap on distinct function names, see
-    /// [`DEFAULT_MAX_FUNCTIONS_PER_TENANT`]. A field (not that constant
+    /// `DEFAULT_MAX_FUNCTIONS_PER_TENANT`. A field (not that constant
     /// directly) so tests can dial it down and exercise the quota boundary
     /// cheaply.
     pub max_functions_per_tenant: i64,
