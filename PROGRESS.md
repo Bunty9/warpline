@@ -29,26 +29,49 @@
       `examples/hello-wasm/` produces a `.wasm` (deferred — requires
       `rustup target add wasm32-wasip1`)
 
-## Next sprint — Phase 2: wit-bindgen + live host fns + metering
+## Sprint — Phase 2: wit-bindgen + live host fns + metering (done)
 
-- [ ] Generate Component-Model bindings via `wit-bindgen` for both host
-      (Rust) and guest (`hello-wasm` switches off raw `extern "C"`).
-- [ ] Real `warpline:host/kv::{get,put}` via `func_wrap_async`, scoped
-      by `t/{tenant_id}/{key}`.
-- [ ] Real `warpline:host/log::emit` propagating to `tracing` with a
-      per-tenant span.
-- [ ] Real `warpline:host/http-out::fetch` with per-tenant
-      `allowed_hosts` enforcement, per-request timeout, response-body
-      size cap.
-- [ ] Wire `meter::record` on the invoke hot path; capture CPU µs from
-      epoch deltas and memory peak from `ResourceLimiter` callbacks.
-- [ ] Move the per-call `TenantLimiter` allocation off
-      `Box::leak` — store inside `HostCtx`.
-- [ ] Module registry: pull `.cwasm` from disk on first invoke of an
-      unknown (tenant, fn) tuple, LRU-evict cold entries.
-- [ ] Tenant auth on `warpline-control`: API-key header validated
-      against `tenants` table; rate-limit uploads.
-- [ ] S3 / MinIO backend for the `.cwasm` cache behind a trait.
+- [x] Generate Component-Model bindings via `wit-bindgen` for both host
+      (Rust, `wasmtime::component::bindgen!` against `wit/warpline.wit`)
+      and guest (`hello-wasm`/`test-guest` via `wit_bindgen::generate!`,
+      targeting `wasm32-wasip2` — no adapter step).
+- [x] Real `warpline:host/kv::{get,put}` — `HostCtx` holds a
+      `Arc<dyn KvStore>` and scopes every call by `(tenant, key)` as a
+      composite key (not string concatenation — see `kv.rs` module docs),
+      with per-call/per-invocation size and count caps.
+- [x] Real `warpline:host/log::emit` propagating to `tracing`, tagged with
+      `tenant`/`func`, truncated/dropped past per-invocation caps rather
+      than trapping the guest.
+- [x] Real `warpline:host/http-out::fetch` with per-tenant `allowed_hosts`
+      enforcement, a 5 s timeout, a 1 MiB response-body cap, no redirects,
+      no proxy, and SSRF-hardened private/loopback/link-local blocking
+      (`is_blocked_ip` + `GuardedResolver`) — this went further than the
+      original plan, which only called for allowlist + timeout + body cap.
+- [x] Metering wired on the invoke hot path — **deviated from the plan**:
+      instead of a direct `meter::record` call (or a per-invoke
+      `tokio::spawn`), completed invocations are queued onto a bounded
+      `mpsc` channel to a single writer task that batches inserts
+      (`meter::spawn_writer`, `METER_CHANNEL_CAPACITY = 10_000`,
+      `BATCH_MAX = 200`) — bounded backpressure under a burst instead of
+      one Postgres write and one spawned task per request.
+- [x] `TenantLimiter` moved into `HostCtx` (no `Box::leak`); doubles as the
+      peak-memory recorder metering reads.
+- [x] Module registry: `warpline_core::registry` — pointer files
+      (`modules/tenants/{tenant}/{func}`) resolved to a content digest,
+      backed by an in-memory `ComponentCache` LRU (256 entries / 512 MiB
+      byte budget). **Deviated from the plan**: the source `.wasm` is also
+      kept on disk (`modules/wasm/{digest}.wasm`), not just the `.cwasm` —
+      an engine/config upgrade invalidates the `.cwasm`'s compatibility
+      hash, and without the source, every existing pointer would 500 until
+      a re-upload; `get_or_load` now recompiles from source on a cache
+      miss instead.
+- [x] Tenant auth on `warpline-control`: bearer-token API keys
+      (SHA-256-hashed, `api_keys` table) validated against `tenants`.
+      **Partially deviated**: uploads are bounded by a process-wide compile
+      concurrency semaphore and a 100-functions-per-tenant quota, not a
+      time-window rate limit — see Phase 3.
+- [ ] S3 / MinIO backend for the `.cwasm` cache behind a trait — deferred,
+      see Phase 3 / README "Roadmap".
 - [x] Bench harness (`crates/core/benches/{runtime,report}.rs`, criterion +
       a plain-`main` measurement report):
     - cold-start `.wasm` vs `.cwasm` (criterion `cold_compile` /
@@ -61,10 +84,42 @@
     - instances/sec/core sweep (`report.rs`, single-core sequential
       throughput).
     - cost-per-million vs Cloudflare Workers (back-of-envelope, see below).
+- [x] Fixed a CPU-cap drift bug found while gathering the bench numbers
+      above: the epoch ticker now sleeps to an absolute schedule instead of
+      a relative `sleep(tick)` per iteration (see "Notes on the misses"
+      below).
+
+## Next sprint — Phase 3
+
+Real remaining work, from the `ponytail:` notes left in the code and the
+items deferred out of Phase 2 (also tracked in README "Roadmap / deferred"):
+
+- [ ] Per-tenant upload rate limiting (time-window, not just the compile
+      concurrency semaphore + 100-function quota that landed in Phase 2).
+- [ ] Single-flight dedupe on a cold `.cwasm` digest — a burst of
+      concurrent first-invokes for one freshly-uploaded function each pay
+      for their own recompile today (`crates/core/src/registry.rs`,
+      `ComponentCache::get_or_load`).
+- [ ] S3/MinIO-backed `.cwasm` registry, behind the same `registry` trait
+      boundary, for a multi-host deploy (the shared local volume only
+      covers one box).
+- [ ] Instance pooling / warm-store reuse (wasmtime's pooling allocator) —
+      every invoke currently builds a fresh `Store`.
+- [ ] Hyperlight spike — sub-millisecond ephemeral instances (Microsoft,
+      Mar 2025) as a possible alternative isolation boundary.
+- [ ] End-to-end bench through `warpline-host`'s actual HTTP path with a
+      realistic handler (the current bench harness calls
+      `warpline-core::invoke` directly — see the cost-per-million caveat
+      below).
 
 ## Done
 
-(none yet — scaffold landing is the first commit)
+- Phase 1 scaffold (see above) — workspace skeleton, stub host fns,
+  Postgres schema v1, Docker/Fly deployment shape.
+- Phase 2 — live wasmtime 49 Component Model runtime, real host imports,
+  module registry + content-addressed cache, API-key auth, per-tenant
+  config and quotas, batched metering, criterion + report bench harness
+  with measured numbers (see below), the epoch-ticker drift fix.
 
 ## Blocked
 

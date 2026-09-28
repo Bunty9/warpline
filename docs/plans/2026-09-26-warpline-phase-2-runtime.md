@@ -1,6 +1,6 @@
 ---
 title: warpline Phase 2 — Live runtime (Component Model, host fns, registry, metering)
-status: in-progress
+status: done
 date: 2026-09-26
 related:
     - ../specs/2026-05-28-warpline-design.md
@@ -43,15 +43,59 @@ related:
 
 ## Tasks
 
-1. Runtime core — deps upgrade, bindgen host, live kv/log/http-out,
+1. [x] Runtime core — deps upgrade, bindgen host, live kv/log/http-out,
    epoch ticker, limiter-in-ctx, component cache, test guest + tests.
-2. Registry + control/host wiring — pointer files, LRU, auth, metering,
+2. [x] Registry + control/host wiring — pointer files, LRU, auth, metering,
    migrations on boot, upload size cap, name validation.
-3. Bench harness (criterion) + numbers in PROGRESS.md.
-4. Docs, CI, Docker/compose refresh; `cargo deny` green.
+3. [x] Bench harness (criterion) + numbers in PROGRESS.md.
+4. [x] Docs, CI, Docker/compose refresh; `cargo deny` green.
 
 ## Deferred
 
 - S3/MinIO `.cwasm` backend (local shared volume covers one-box deploys).
 - Instance pooling / warm-store reuse (pooling allocator).
 - Hyperlight.
+
+## Outcome
+
+Landed across `be938b4` (live Component Model runtime), `48f09c6` (runtime
+caps/KV isolation/cache/egress hardening), `8f8d84e` (registry, API-key
+auth, tenant config, metering), `1490999` (registry/upload/metering/metrics
+hardening), `57901fb` (bench harness + measured numbers), and `046cc0e`
+(epoch-ticker drift fix). All four tasks above are done; every decision in
+"Decisions" above shipped as described, with these deviations from the
+original task list:
+
+- **Metering is batched, not per-call.** The plan said "wire
+  `meter::record` on the invoke hot path." What shipped instead is a
+  bounded `mpsc` channel (`meter::spawn_writer`, capacity 10,000, batches
+  of up to 200) draining into a single writer task — a burst of invokes no
+  longer spawns one Postgres write per request, and a full channel drops
+  the row (counted via `warpline_meter_dropped_total`) instead of blocking
+  the response.
+- **`/metrics` is a separate listener.** Not called out in the original
+  plan. `warpline-host` serves Prometheus metrics on its own
+  `axum::serve` instance (`WARPLINE_METRICS_BIND`, default
+  `127.0.0.1:9090`), not on the invoke router — a scrape endpoint exposing
+  per-tenant series shouldn't share a socket with whatever's publicly
+  reachable.
+- **Source `.wasm` retention.** The plan described the registry as
+  `.wasm` + `.cwasm` written by the control plane and read by the host; it
+  didn't call out that the source `.wasm` needs to *stay* on disk. It does
+  (`modules/wasm/{digest}.wasm`): the `.cwasm`'s cache key folds in
+  `Engine::precompile_compatibility_hash()`, so an engine/config upgrade
+  (or simple corruption) invalidates or removes the `.cwasm` without
+  warning, and `ComponentCache::get_or_load` needs the source to recompile
+  from rather than 500ing every existing pointer forever.
+- **Epoch ticker drift fix.** Not part of the original plan — found while
+  gathering the Phase 2 bench numbers (`PROGRESS.md`'s "Notes on the
+  misses"). The ticker originally slept a relative `EPOCH_TICK_MS` per
+  iteration; the overshoot compounded because budgets are counted in
+  ticks (~+12% at a 100 ms budget). It now sleeps to an absolute schedule
+  instead, landed in `046cc0e`.
+- **Upload "rate-limit" became concurrency + count caps, not a rate
+  limiter.** The plan's task 2 mentioned "rate-limit uploads"; what
+  shipped is a process-wide compile-concurrency semaphore
+  (`max(available_parallelism / 2, 1)` permits) plus a 100-functions-per-
+  tenant quota, not a time-window rate limit. Tracked as real remaining
+  work in `PROGRESS.md`'s Phase 3 list.

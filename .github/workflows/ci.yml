@@ -13,15 +13,28 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, beta]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: warpline
+          POSTGRES_PASSWORD: warpline
+          POSTGRES_DB: warpline_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U warpline -d warpline_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Picked up by crates/{host,control}/tests/db_mode.rs — unset in a
+      # local run, those tests just skip themselves.
+      WARPLINE_TEST_DATABASE_URL: postgres://warpline:warpline@localhost:5432/warpline_test
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install nextest
@@ -34,6 +47,23 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast
+
+  msrv:
+    name: cargo check (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check --workspace
+        run: cargo check --workspace
 
   deny:
     name: cargo-deny
@@ -60,15 +90,24 @@ jobs:
       - name: cargo bench --no-run
         run: cargo bench --workspace --no-run
 
-  build-wasm-example:
-    name: build hello-wasm (wasm32-wasip1)
+  build-guest-fixture:
+    name: build guests (wasm32-wasip2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Add wasm32-wasip1 target
-        run: rustup target add wasm32-wasip1
-      - name: Build hello-wasm
-        working-directory: examples/hello-wasm
-        run: cargo build --target wasm32-wasip1 --release
+      - name: Add wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2
+      - name: Build examples/{hello-wasm,test-guest} and refresh the test fixture
+        run: ./scripts/build-guests.sh
+      # `scripts/build-guests.sh` overwrites
+      # crates/core/tests/fixtures/test_guest.wasm from a fresh build of
+      # examples/test-guest. Verified locally (two clean `cargo build
+      # --release --target wasm32-wasip2` runs of examples/test-guest) that
+      # the output is byte-for-byte reproducible on this toolchain, so a
+      # diff here means the committed fixture is stale relative to
+      # examples/test-guest's source and needs `./scripts/build-guests.sh`
+      # run and committed.
+      - name: Fail if the committed fixture is stale
+        run: git diff --exit-code -- crates/core/tests/fixtures/test_guest.wasm
