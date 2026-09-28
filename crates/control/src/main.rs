@@ -21,7 +21,7 @@ use axum::{
 };
 use wasmtime::Engine;
 
-use warpline_core::{cache::load_or_compile, runtime::build_engine};
+use warpline_core::{cache::load_or_compile, runtime::build_engine, types::valid_name};
 
 #[derive(Clone)]
 struct AppState {
@@ -68,6 +68,14 @@ async fn upload(
     Path((tenant, func)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    if !valid_name(&tenant) || !valid_name(&func) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid tenant or function name".to_string(),
+        )
+            .into_response();
+    }
+
     let mut wasm_bytes: Option<Vec<u8>> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();

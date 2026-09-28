@@ -8,6 +8,8 @@
 //! - `alloc`            — leaks 1 MiB `Vec`s forever (memory-cap test).
 //! - `kv:put:{k}:{v}`   — `kv::put(k, v)`, returns `ok`.
 //! - `kv:get:{k}`       — `kv::get(k)`, returns the value or `none`.
+//! - `kv:fill`          — `kv::put`s 4 KiB values under unique keys forever
+//!                         (per-invocation KV quota trap test).
 //! - `log:{msg}`        — `log::emit("info", msg)`, returns `ok`.
 //! - `fetch:{url}`      — `http-out::fetch` a GET, returns
 //!                        `status:{n}:{body}` or `err:{msg}`.
@@ -47,6 +49,15 @@ impl Guest for TestGuest {
 
         if input == b"panic" {
             panic!("test-guest: panic requested");
+        }
+
+        if input == b"kv:fill" {
+            let value = vec![0xAAu8; 4096];
+            let mut i: u64 = 0;
+            loop {
+                kv::put(&format!("fill-{i}"), &value);
+                i += 1;
+            }
         }
 
         let Ok(text) = std::str::from_utf8(&input) else {

@@ -29,7 +29,7 @@ use wasmtime::Engine;
 use warpline_core::{
     kv::{KvStore, MemKv},
     runtime::{build_engine, build_http_client, build_linker, invoke, EpochTicker, InvokeError},
-    types::HostCtx,
+    types::{valid_name, HostCtx},
 };
 
 /// Key into the in-process module registry. (tenant, fn-name) -> compiled
@@ -46,6 +46,7 @@ struct AppState {
     modules: Arc<RwLock<HashMap<ModuleKey, Arc<Component>>>>,
     kv: Arc<dyn KvStore>,
     http_client: reqwest::Client,
+    allow_private_egress: bool,
     /// Keeps the engine's epoch-ticker thread alive for the process
     /// lifetime; never read, only held.
     _ticker: Arc<EpochTicker>,
@@ -64,7 +65,13 @@ async fn main() -> anyhow::Result<()> {
     let engine = build_engine()?;
     let linker = build_linker(&engine)?;
     let ticker = EpochTicker::spawn(engine.clone());
-    let http_client = build_http_client()?;
+    // Deny-by-default: outbound HTTP refuses loopback/private/link-local/etc.
+    // targets unless explicitly opted into (e.g. local dev against a
+    // sidecar). See `warpline_core::runtime::is_blocked_ip`.
+    let allow_private_egress = std::env::var("WARPLINE_ALLOW_PRIVATE_EGRESS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let http_client = build_http_client(allow_private_egress)?;
 
     let state = AppState {
         engine,
@@ -72,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         modules: Arc::new(RwLock::new(HashMap::new())),
         kv: Arc::new(MemKv::new()),
         http_client,
+        allow_private_egress,
         _ticker: Arc::new(ticker),
     };
 
@@ -95,6 +103,14 @@ async fn invoke_handler(
     Path((tenant, func)): Path<(String, String)>,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !valid_name(&tenant) || !valid_name(&func) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid tenant or function name".to_string(),
+        )
+            .into_response();
+    }
+
     let key = (tenant.clone(), func.clone());
     let component = {
         let guard = state.modules.read().await;
@@ -115,6 +131,7 @@ async fn invoke_handler(
         func.clone(),
         state.kv.clone(),
         Vec::new(),
+        state.allow_private_egress,
         state.http_client.clone(),
         64 * 1024 * 1024,
     );
@@ -141,16 +158,29 @@ async fn invoke_handler(
             (StatusCode::OK, outcome.output).into_response()
         }
         Err(e) => {
-            // Budget/cap/timeout failures are the guest's own doing —
-            // 408/413-ish; anything else is a host-side trap or bug.
-            let status = match e {
-                InvokeError::CpuBudgetExceeded { .. }
-                | InvokeError::MemoryCapExceeded { .. }
-                | InvokeError::WallClockTimeout(_) => StatusCode::REQUEST_TIMEOUT,
-                InvokeError::GuestTrap(_) => StatusCode::UNPROCESSABLE_ENTITY,
-                InvokeError::Instantiate(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            tracing::warn!(%tenant, %func, error = %e, "invoke failed");
+            // Budget/timeout is the guest's own doing (408); a memory-cap
+            // trip means the guest asked for more than its tenant is
+            // allotted (507); anything else is a host-side trap or bug
+            // (500). Bodies stay free of host paths/internals — the
+            // `Display` impls on `InvokeError` never include either.
+            let (status, body) = match e {
+                InvokeError::CpuBudgetExceeded { .. } | InvokeError::WallClockTimeout(_) => {
+                    (StatusCode::REQUEST_TIMEOUT, e.to_string())
+                }
+                InvokeError::MemoryCapExceeded { .. } => {
+                    (StatusCode::INSUFFICIENT_STORAGE, e.to_string())
+                }
+                InvokeError::GuestTrap(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "guest trapped".to_string(),
+                ),
+                InvokeError::Instantiate(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to instantiate component".to_string(),
+                ),
             };
-            (status, format!("invoke failed: {e}")).into_response()
+            (status, body).into_response()
         }
     }
 }

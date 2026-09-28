@@ -2,8 +2,9 @@
 //!
 //! One [`HostCtx`] is constructed for every call to [`crate::runtime::invoke`].
 //! It carries tenant identity, the KV backend, the outbound-HTTP allowlist +
-//! shared `reqwest::Client`, the WASI p2 state, and the [`TenantLimiter`]
-//! that enforces the memory cap and records peak usage for metering.
+//! shared `reqwest::Client`, the WASI p2 state, the per-invocation KV/log
+//! quota counters, and the [`TenantLimiter`] that enforces the memory/table
+//! cap and records peak usage for metering.
 //!
 //! The hand-written `HttpReq`/`HttpResp` envelopes from Phase 1 are gone —
 //! `wasmtime::component::bindgen!` in `runtime.rs` generates `Request` /
@@ -17,6 +18,19 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::kv::KvStore;
 
+/// Returns true iff `s` matches `^[a-z0-9][a-z0-9_-]{0,62}$` — the shape
+/// required of tenant and function names. Hand-rolled rather than pulling
+/// in a regex crate for one pattern.
+pub fn valid_name(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    let is_head = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let is_tail = |b: u8| is_head(b) || b == b'_' || b == b'-';
+    is_head(bytes[0]) && bytes[1..].iter().all(|&b| is_tail(b))
+}
+
 /// Per-invocation host context. See module docs.
 pub struct HostCtx {
     pub tenant_id: String,
@@ -25,13 +39,34 @@ pub struct HostCtx {
     /// Outbound HTTP host allowlist (deny-by-default — see
     /// `runtime::host_http_out`).
     pub allowed_hosts: Vec<String>,
+    /// When `false` (the default outside tests), `http-out::fetch` refuses
+    /// to connect to loopback/private/link-local/etc. addresses — see
+    /// `runtime::is_blocked_ip`. Tests that stand up a `127.0.0.1` server
+    /// set this `true`.
+    pub allow_private_egress: bool,
     /// Shared `reqwest::Client` — cheap to clone, expensive to build (each
     /// one owns a connection pool), so callers construct one per process and
     /// pass it into every `HostCtx`.
     pub http_client: reqwest::Client,
-    /// Memory cap + peak-usage tracker, installed on the `Store` via
+    /// Memory/table cap + peak-usage tracker, installed on the `Store` via
     /// `store.limiter(|c| &mut c.limiter)`.
     pub limiter: TenantLimiter,
+    /// `kv::put` calls made so far this invocation — capped at
+    /// [`crate::runtime::MAX_KV_PUTS_PER_INVOCATION`].
+    pub(crate) kv_put_count: usize,
+    /// `kv::put` value bytes written so far this invocation — capped at
+    /// [`crate::runtime::MAX_KV_PUT_BYTES_PER_INVOCATION`].
+    pub(crate) kv_put_bytes: usize,
+    /// `log::emit` lines emitted so far this invocation — capped at
+    /// [`crate::runtime::MAX_LOG_LINES_PER_INVOCATION`].
+    pub(crate) log_line_count: usize,
+    /// `log::emit` message bytes emitted so far this invocation — capped at
+    /// [`crate::runtime::MAX_LOG_BYTES_PER_INVOCATION`].
+    pub(crate) log_bytes: usize,
+    /// Set once the log limit has been hit, so the "log output suppressed"
+    /// notice is only emitted once per invocation instead of once per
+    /// dropped line.
+    pub(crate) log_suppressed_notified: bool,
     wasi_ctx: WasiCtx,
     table: ResourceTable,
 }
@@ -40,11 +75,13 @@ impl HostCtx {
     /// Build a [`HostCtx`] with a deny-by-default WASI p2 context: no
     /// preopens, no env, no args, no network — only what the guest's Rust
     /// std needs to link (clocks, random, a stdio sink).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_id: String,
         fn_name: String,
         kv: Arc<dyn KvStore>,
         allowed_hosts: Vec<String>,
+        allow_private_egress: bool,
         http_client: reqwest::Client,
         mem_cap_bytes: usize,
     ) -> Self {
@@ -53,8 +90,14 @@ impl HostCtx {
             fn_name,
             kv,
             allowed_hosts,
+            allow_private_egress,
             http_client,
             limiter: TenantLimiter::new(mem_cap_bytes),
+            kv_put_count: 0,
+            kv_put_bytes: 0,
+            log_line_count: 0,
+            log_bytes: 0,
+            log_suppressed_notified: false,
             wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
         }
@@ -70,27 +113,57 @@ impl WasiView for HostCtx {
     }
 }
 
+/// Small sane ceiling on core instances a single component's `Store` may
+/// create. A `wasm32-wasip2` component built with `wit-bindgen` typically
+/// instantiates on the order of a dozen core modules (its own module plus
+/// the WASI p2 adapter modules it imports); 32 leaves headroom for that
+/// while still catching a component that tries to spin up an unbounded
+/// number of sub-instances.
+const MAX_INSTANCES: usize = 32;
+/// Small sane ceiling on core tables a single `Store` may create.
+const MAX_TABLES: usize = 8;
+/// Small sane ceiling on core linear memories a single `Store` may create —
+/// most components have exactly one; a handful covers multi-memory
+/// components without leaving the cap effectively unbounded.
+const MAX_MEMORIES: usize = 4;
+
 /// Memory + table-growth limiter installed on the wasmtime `Store` via
 /// `Store::limiter`. Each tenant gets its own ceiling — runaway allocators
-/// are rejected when `memory.grow` would push the linear memory above the
-/// cap — and the limiter doubles as the peak-memory recorder for metering.
+/// are rejected when `memory.grow`/`table.grow` would push the *combined*
+/// size of every memory/table in the store above the cap — and the limiter
+/// doubles as the peak-memory recorder for metering.
+///
+/// A component can have many core memories (its own module plus every
+/// dependency it links against), each capable of growing independently;
+/// checking `desired` against the cap per-memory (as an earlier version of
+/// this limiter did) lets a component with N memories use N times the
+/// intended cap. Tracking a running `total_bytes` across every memory this
+/// limiter has seen closes that.
 pub struct TenantLimiter {
     pub mem_cap_bytes: usize,
-    /// High-water mark of every `desired` size this limiter has accepted.
+    /// Sum of `desired - current` over every accepted `memory_growing` call
+    /// — the combined size of every core memory in the store.
+    total_bytes: usize,
+    /// High-water mark of [`Self::total_bytes`].
     pub peak_bytes: usize,
     /// Set once `memory_growing` rejects a request — lets `invoke`
     /// distinguish "guest hit the memory cap" from any other trap.
     pub cap_hit: bool,
-    table_cap: usize,
+    table_cap_elems: usize,
+    /// Sum of `desired - current` over every accepted `table_growing` call,
+    /// mirroring `total_bytes` for tables.
+    total_table_elems: usize,
 }
 
 impl TenantLimiter {
     pub fn new(mem_cap_bytes: usize) -> Self {
         Self {
             mem_cap_bytes,
+            total_bytes: 0,
             peak_bytes: 0,
             cap_hit: false,
-            table_cap: 10_000,
+            table_cap_elems: 10_000,
+            total_table_elems: 0,
         }
     }
 }
@@ -98,12 +171,19 @@ impl TenantLimiter {
 impl wasmtime::ResourceLimiter for TenantLimiter {
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
-        _max: Option<usize>,
+        max: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        if desired <= self.mem_cap_bytes {
-            self.peak_bytes = self.peak_bytes.max(desired);
+        // wasmtime consults the limiter before the memory's own declared
+        // max; reject those here so a doomed grow isn't charged.
+        if max.is_some_and(|m| desired > m) {
+            return Ok(false);
+        }
+        let new_total = self.total_bytes + desired.saturating_sub(current);
+        if new_total <= self.mem_cap_bytes {
+            self.total_bytes = new_total;
+            self.peak_bytes = self.peak_bytes.max(self.total_bytes);
             Ok(true)
         } else {
             self.cap_hit = true;
@@ -113,10 +193,57 @@ impl wasmtime::ResourceLimiter for TenantLimiter {
 
     fn table_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
-        _max: Option<usize>,
+        max: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(desired <= self.table_cap)
+        if max.is_some_and(|m| desired > m) {
+            return Ok(false);
+        }
+        let new_total = self.total_table_elems + desired.saturating_sub(current);
+        if new_total <= self.table_cap_elems {
+            self.total_table_elems = new_total;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn instances(&self) -> usize {
+        MAX_INSTANCES
+    }
+
+    fn tables(&self) -> usize {
+        MAX_TABLES
+    }
+
+    fn memories(&self) -> usize {
+        MAX_MEMORIES
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_name;
+
+    #[test]
+    fn valid_name_accepts_expected_shapes() {
+        assert!(valid_name("a"));
+        assert!(valid_name("tenant-a"));
+        assert!(valid_name("fn_1"));
+        assert!(valid_name("0abc"));
+        assert!(valid_name(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn valid_name_rejects_bad_shapes() {
+        assert!(!valid_name(""));
+        assert!(!valid_name(&"a".repeat(64)));
+        assert!(!valid_name("-leading-dash"));
+        assert!(!valid_name("Uppercase"));
+        assert!(!valid_name("has space"));
+        assert!(!valid_name("has/slash"));
+        assert!(!valid_name("has.dot"));
+        assert!(!valid_name("../traversal"));
     }
 }
