@@ -251,8 +251,22 @@ impl EpochTicker {
         let handle = std::thread::Builder::new()
             .name("warpline-epoch-ticker".into())
             .spawn(move || {
+                // Sleep to an absolute schedule rather than `sleep(tick)`
+                // in a loop: each relative sleep overshoots a little, and
+                // since budgets are counted in ticks that drift compounds
+                // (~+12% at a 100 ms budget before this change).
+                let tick = Duration::from_millis(EPOCH_TICK_MS);
+                let mut next = std::time::Instant::now();
                 while !stop_thread.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
+                    next += tick;
+                    let now = std::time::Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else if now - next > tick * 10 {
+                        // Badly behind (host suspended, starved thread):
+                        // resync instead of bursting ticks.
+                        next = now;
+                    }
                     engine.increment_epoch();
                 }
             })
