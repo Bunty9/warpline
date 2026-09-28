@@ -1,6 +1,6 @@
 ---
 title: Publishing warpline to crates.io
-status: ready (not yet published)
+status: done — v0.1.0 published 2026-09-28
 date: 2026-09-28
 ---
 
