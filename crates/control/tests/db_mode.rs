@@ -278,3 +278,54 @@ async fn upload_enforces_per_tenant_function_quota() {
     let status = upload_status(&app, &tenant, "f0", &key, wasm).await;
     assert_eq!(status, StatusCode::CREATED, "re-upload of existing name");
 }
+
+/// Finding 5: the per-tenant quota check + insert must be serialized across
+/// *all* of a tenant's uploads, not just uploads of the same func name — two
+/// concurrent uploads of two different *new* names, both racing the last
+/// slot under the cap, must not both pass the count check. Uses
+/// `AppState::max_functions_per_tenant` (rather than uploading 100 real
+/// functions) to get to "one slot left" cheaply.
+#[tokio::test]
+async fn upload_quota_race_allows_exactly_one_of_two_new_names() {
+    let db = require_test_db!();
+    let tenant = unique_tenant("qrace");
+    let wasm: &'static [u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../core/tests/fixtures/test_guest.wasm"
+    ));
+    let (mut state, _dir) = state(db, Some("tok")).await;
+    state.max_functions_per_tenant = 2;
+    let app = router(state);
+
+    let (_, json) = post(&app, &format!("/admin/tenants/{tenant}"), Some("tok"), None).await;
+    let key = json["api_key"].as_str().unwrap().to_string();
+
+    // One slot used, one left under the cap of 2.
+    let status = upload_status(&app, &tenant, "f0", &key, wasm).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Two distinct new names race for that last slot.
+    let (r1, r2) = tokio::join!(
+        tokio::spawn({
+            let app = app.clone();
+            let tenant = tenant.clone();
+            let key = key.clone();
+            async move { upload_status(&app, &tenant, "f1", &key, wasm).await }
+        }),
+        tokio::spawn({
+            let app = app.clone();
+            let tenant = tenant.clone();
+            let key = key.clone();
+            async move { upload_status(&app, &tenant, "f2", &key, wasm).await }
+        }),
+    );
+    let (s1, s2) = (r1.unwrap(), r2.unwrap());
+    let successes = [s1, s2]
+        .iter()
+        .filter(|s| **s == StatusCode::CREATED)
+        .count();
+    assert_eq!(
+        successes, 1,
+        "exactly one concurrent new-name upload should pass the quota, got {s1:?} and {s2:?}"
+    );
+}

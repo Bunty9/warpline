@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     // Run once, before serving: clean up any wasm/cwasm blob no pointer
     // references (finding 3) — e.g. left behind by a crash between
     // persisting a blob and writing its pointer.
-    match registry::gc_unreferenced_blobs(&modules_dir) {
+    match registry::gc_unreferenced_blobs(&modules_dir, &engine, registry::GC_GRACE_PERIOD) {
         Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
         Err(e) => tracing::warn!(error = %e, "startup GC failed"),
     }

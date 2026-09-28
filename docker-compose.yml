@@ -28,11 +28,6 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mount migrations so the host container can run `sqlx migrate run` on
-      # boot if you wire that step into the entrypoint. The image already
-      # ships a copy under /app/migrations; this bind mount lets you iterate
-      # on schema changes without rebuilding.
-      - ./migrations:/app/migrations:ro
       # Shared with warpline-control — the host reads `.cwasm`s and pointer
       # files the control plane writes; see `warpline_core::registry`.
       - modules_data:/var/lib/warpline/modules
@@ -55,7 +50,6 @@ services:
     ports:
       - "8081:8081"
     volumes:
-      - ./migrations:/app/migrations:ro
       - modules_data:/var/lib/warpline/modules
     entrypoint: ["/usr/local/bin/warpline-control"]
 

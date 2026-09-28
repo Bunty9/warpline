@@ -11,7 +11,10 @@ name = "warpline-host"
 path = "src/main.rs"
 
 [dependencies]
-warpline-core = { path = "../core" }
+# Optional in-process control plane (`WARPLINE_EMBED_CONTROL=1`) for
+# single-machine deploys where host and control must share one volume.
+warpline-control = { path = "../control", version = "0.1.0" }
+warpline-core = { path = "../core", version = "0.1.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -33,4 +36,3 @@ bytes = { workspace = true }
 tempfile = "3"
 # Dev-mode end-to-end tests upload through the real control-plane router
 # into a shared tempdir modules dir, then invoke through this crate's.
-warpline-control = { path = "../control" }

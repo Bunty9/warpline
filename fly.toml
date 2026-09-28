@@ -16,12 +16,20 @@ kill_timeout = "30s"
 
 [build]
   dockerfile = "Dockerfile"
+  # Root runtime: the Fly volume mount is root-owned (see Dockerfile).
+  build-target = "runtime-root"
 
 [env]
   RUST_LOG = "info"
   WARPLINE_HOST_BIND = "0.0.0.0:8080"
   WARPLINE_CONTROL_BIND = "0.0.0.0:8081"
   WARPLINE_MODULES_DIR = "/var/lib/warpline/modules"
+  # Fly volumes attach to a single machine, so run the control plane inside
+  # the host process (same engine, same volume).
+  WARPLINE_EMBED_CONTROL = "1"
+  # NOTE: DATABASE_URL and WARPLINE_ADMIN_TOKEN must be set as Fly secrets
+  # fly secrets set DATABASE_URL='postgres://...'
+  # fly secrets set WARPLINE_ADMIN_TOKEN='...'
 
 [http_service]
   internal_port = 8080

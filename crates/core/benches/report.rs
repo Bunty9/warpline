@@ -17,7 +17,8 @@ use wasmtime::component::Component;
 
 use warpline_core::kv::{KvStore, MemKv};
 use warpline_core::runtime::{
-    build_engine, build_http_client, build_linker, invoke, EpochTicker, InvokeError,
+    build_engine, build_http_client, build_linker, instantiate_pre, invoke, EpochTicker,
+    InvokeError,
 };
 use warpline_core::types::HostCtx;
 
@@ -53,6 +54,7 @@ fn main() {
     let linker = build_linker(&engine).expect("build linker");
     let _ticker = EpochTicker::spawn(engine.clone());
     let component = Component::new(&engine, TEST_GUEST_WASM).expect("compile fixture");
+    let pre = instantiate_pre(&linker, &component).expect("instantiate_pre");
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let http_client = build_http_client(true).expect("build http client");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -71,8 +73,7 @@ fn main() {
             let start = Instant::now();
             invoke(
                 &engine,
-                &linker,
-                &component,
+                &pre,
                 ctx,
                 b"warm-invoke-echo-payload".to_vec(),
                 WARM_BUDGET_MS,
@@ -101,8 +102,7 @@ fn main() {
             let ctx = make_ctx(kv.clone(), http_client.clone(), DEFAULT_MEM_CAP);
             invoke(
                 &engine,
-                &linker,
-                &component,
+                &pre,
                 ctx,
                 b"warm-invoke-echo-payload".to_vec(),
                 WARM_BUDGET_MS,
@@ -119,14 +119,7 @@ fn main() {
         let ctx = make_ctx(kv.clone(), http_client.clone(), DEFAULT_MEM_CAP);
         let start = Instant::now();
         let err = rt
-            .block_on(invoke(
-                &engine,
-                &linker,
-                &component,
-                ctx,
-                b"loop".to_vec(),
-                budget_ms,
-            ))
+            .block_on(invoke(&engine, &pre, ctx, b"loop".to_vec(), budget_ms))
             .expect_err("infinite loop should trap on cpu budget");
         let elapsed = start.elapsed();
         assert!(
@@ -144,14 +137,7 @@ fn main() {
     let mem_cap = 16 * 1024 * 1024;
     let ctx = make_ctx(kv.clone(), http_client.clone(), mem_cap);
     let err = rt
-        .block_on(invoke(
-            &engine,
-            &linker,
-            &component,
-            ctx,
-            b"alloc".to_vec(),
-            5_000,
-        ))
+        .block_on(invoke(&engine, &pre, ctx, b"alloc".to_vec(), 5_000))
         .expect_err("runaway allocator should trap on memory cap");
     match err {
         InvokeError::MemoryCapExceeded {

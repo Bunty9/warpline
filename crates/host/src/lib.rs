@@ -150,8 +150,9 @@ async fn invoke_handler(
         }
     };
 
-    let component = match registry::resolve(
+    let pre = match registry::resolve(
         state.engine.clone(),
+        state.linker.clone(),
         state.component_cache.clone(),
         state.modules_dir.clone(),
         tenant.clone(),
@@ -159,7 +160,7 @@ async fn invoke_handler(
     )
     .await
     {
-        Ok(Some(c)) => c,
+        Ok(Some(p)) => p,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -190,8 +191,7 @@ async fn invoke_handler(
     let wall_started = Instant::now();
     let result = invoke(
         &state.engine,
-        &state.linker,
-        &component,
+        &pre,
         ctx,
         body.to_vec(),
         authed.config.cpu_budget_ms,

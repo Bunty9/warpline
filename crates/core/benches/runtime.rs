@@ -22,7 +22,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use wasmtime::component::Component;
 
 use warpline_core::kv::{KvStore, MemKv};
-use warpline_core::runtime::{build_engine, build_http_client, build_linker, invoke, EpochTicker};
+use warpline_core::runtime::{
+    build_engine, build_http_client, build_linker, instantiate_pre, invoke, EpochTicker,
+};
 use warpline_core::types::HostCtx;
 
 const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
@@ -70,6 +72,10 @@ fn warm_invoke_echo(c: &mut Criterion) {
     let linker = build_linker(&engine).expect("build linker");
     let _ticker = EpochTicker::spawn(engine.clone());
     let component = Component::new(&engine, TEST_GUEST_WASM).expect("compile");
+    // Built once, outside the measured loop — see finding 11: this is
+    // exactly the per-digest, not per-invoke, cost `ComponentCache` now
+    // pays too.
+    let pre = instantiate_pre(&linker, &component).expect("instantiate_pre");
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let http_client = build_http_client(true).expect("build http client");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -91,8 +97,7 @@ fn warm_invoke_echo(c: &mut Criterion) {
                 );
                 let out = invoke(
                     &engine,
-                    &linker,
-                    &component,
+                    &pre,
                     ctx,
                     black_box(b"warm-invoke-echo-payload".to_vec()),
                     WARM_BUDGET_MS,

@@ -77,7 +77,10 @@ impl Sha256Hasher {
 /// Hex-encoded SHA-256 over `engine`'s `precompile_compatibility_hash()` —
 /// changes whenever a `.cwasm` compiled by `engine` would no longer be
 /// guaranteed to load in it (wasmtime version, target, codegen config, ...).
-fn compat_hash(engine: &Engine) -> String {
+/// `pub(crate)` so `registry::gc_unreferenced_blobs` can recognise (and
+/// collect) a `.cwasm` compiled for a different engine than the current
+/// one, the same way [`cache_file_name`] folds it into the file name.
+pub(crate) fn compat_hash(engine: &Engine) -> String {
     let mut hasher = Sha256Hasher(Sha256::new());
     engine.precompile_compatibility_hash().hash(&mut hasher);
     hasher.finalize_hex()

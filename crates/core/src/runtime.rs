@@ -298,19 +298,33 @@ pub fn build_linker(engine: &Engine) -> anyhow::Result<Linker<HostCtx>> {
     Ok(linker)
 }
 
+/// Build the pre-instantiated [`HandlerPre`] for `component` against
+/// `linker` — every import check and the `handle`-export check that
+/// `instantiate_async` would otherwise redo on *every* invoke, done once
+/// here instead. [`registry::ComponentCache`] calls this once per loaded
+/// component and caches the result; [`invoke`] takes the cached
+/// `HandlerPre` rather than a bare `Component` + `Linker` pair so a warm
+/// invoke's `instantiate_async` skips straight to instance creation.
+///
+/// `linker.instantiate_pre` alone already checks every import; wrapping the
+/// result in [`HandlerPre::new`] additionally checks the `handle` export,
+/// which `instantiate_pre` doesn't look at.
+pub fn instantiate_pre(
+    linker: &Linker<HostCtx>,
+    component: &Component,
+) -> anyhow::Result<HandlerPre<HostCtx>> {
+    let instance_pre = linker.instantiate_pre(component)?;
+    Ok(HandlerPre::new(instance_pre)?)
+}
+
 /// Type-check `component` against `linker` — every import the component
 /// declares must be satisfiable by what `linker` provides (WASI p2 plus the
 /// `warpline:host` capability surface) and it must export `handle` with the
 /// right signature. Used by `warpline-control` at upload time so a
 /// component that imports something we don't provide is rejected with a
 /// 422 there, rather than failing to instantiate on its first invoke.
-///
-/// `linker.instantiate_pre` alone already checks every import; wrapping the
-/// result in [`HandlerPre::new`] additionally checks the `handle` export,
-/// which `instantiate_pre` doesn't look at.
 pub fn typecheck_component(linker: &Linker<HostCtx>, component: &Component) -> anyhow::Result<()> {
-    let instance_pre = linker.instantiate_pre(component)?;
-    HandlerPre::new(instance_pre)?;
+    instantiate_pre(linker, component)?;
     Ok(())
 }
 
@@ -569,8 +583,14 @@ fn classify_trap(err: wasmtime::Error, store: &Store<HostCtx>, budget_ms: u64) -
     InvokeError::GuestTrap(err.to_string())
 }
 
-/// Invoke `component`'s exported `handle(input: list<u8>) -> list<u8>`
-/// inside a fresh [`Store`] carrying `ctx`.
+/// Invoke `pre`'s exported `handle(input: list<u8>) -> list<u8>` inside a
+/// fresh [`Store`] carrying `ctx`.
+///
+/// `pre` is a [`HandlerPre`] built once (by [`instantiate_pre`], via
+/// [`registry::ComponentCache`]) rather than a bare `Component` + `Linker`
+/// pair — `pre.instantiate_async` below skips the import/export type-check
+/// `Handler::instantiate_async(store, component, linker)` would otherwise
+/// redo on every single call.
 ///
 /// `cpu_budget_ms` is enforced via a cooperative-yield epoch deadline
 /// callback (see module docs); the whole call is additionally bounded by a
@@ -580,8 +600,7 @@ fn classify_trap(err: wasmtime::Error, store: &Store<HostCtx>, budget_ms: u64) -
 /// host import awaiting I/O).
 pub async fn invoke(
     engine: &Engine,
-    linker: &Linker<HostCtx>,
-    component: &Component,
+    pre: &HandlerPre<HostCtx>,
     ctx: HostCtx,
     input: Vec<u8>,
     cpu_budget_ms: u64,
@@ -610,7 +629,7 @@ pub async fn invoke(
         });
         store.set_epoch_deadline(1);
 
-        let bindings = match Handler::instantiate_async(&mut store, component, linker).await {
+        let bindings = match pre.instantiate_async(&mut store).await {
             Ok(bindings) => bindings,
             // A very small `cpu_budget_ms` can exhaust the epoch deadline
             // during instantiation itself, before `call_handle` ever runs —

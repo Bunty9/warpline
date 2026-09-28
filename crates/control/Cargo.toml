@@ -11,7 +11,7 @@ name = "warpline-control"
 path = "src/main.rs"
 
 [dependencies]
-warpline-core = { path = "../core" }
+warpline-core = { path = "../core", version = "0.1.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

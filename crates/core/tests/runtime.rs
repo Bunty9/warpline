@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Component;
 use wasmtime::Engine;
 
 use warpline_core::cache;
 use warpline_core::kv::{KvStore, MemKv};
 use warpline_core::runtime::{
-    build_engine, build_http_client, build_linker, invoke, EpochTicker, InvokeError,
+    build_engine, build_http_client, build_linker, instantiate_pre, invoke, EpochTicker,
+    HandlerPre, InvokeError,
 };
 use warpline_core::types::HostCtx;
 
@@ -28,12 +29,17 @@ const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
 
 const DEFAULT_MEM_CAP: usize = 64 * 1024 * 1024;
 
-async fn setup() -> (Engine, Linker<HostCtx>, EpochTicker, Component) {
+/// `pre` (a [`HandlerPre`], not a bare `Component` + `Linker`) is what
+/// [`invoke`] now takes — see finding 11: it's built once here, the same
+/// way `ComponentCache::get_or_load` builds it once per digest instead of
+/// on every invoke.
+async fn setup() -> (Engine, HandlerPre<HostCtx>, EpochTicker) {
     let engine = build_engine().expect("build engine");
     let linker = build_linker(&engine).expect("build linker");
     let ticker = EpochTicker::spawn(engine.clone());
     let component = Component::new(&engine, TEST_GUEST_WASM).expect("compile test-guest fixture");
-    (engine, linker, ticker, component)
+    let pre = instantiate_pre(&linker, &component).expect("instantiate_pre");
+    (engine, pre, ticker)
 }
 
 fn make_ctx(
@@ -92,95 +98,60 @@ fn http_response(status_line: &str, body: &[u8], extra_headers: &str) -> Vec<u8>
 
 #[tokio::test]
 async fn echo_roundtrip() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
-    let outcome = invoke(
-        &engine,
-        &linker,
-        &component,
-        ctx,
-        b"hello there".to_vec(),
-        5_000,
-    )
-    .await
-    .expect("invoke ok");
+    let outcome = invoke(&engine, &pre, ctx, b"hello there".to_vec(), 5_000)
+        .await
+        .expect("invoke ok");
     assert_eq!(outcome.output, b"hello there");
 }
 
 #[tokio::test]
 async fn kv_is_scoped_per_tenant() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
 
     let put_ctx = make_ctx("tenant-a", kv.clone(), Vec::new(), DEFAULT_MEM_CAP, true);
-    let out = invoke(
-        &engine,
-        &linker,
-        &component,
-        put_ctx,
-        b"kv:put:foo:bar".to_vec(),
-        5_000,
-    )
-    .await
-    .expect("put ok");
+    let out = invoke(&engine, &pre, put_ctx, b"kv:put:foo:bar".to_vec(), 5_000)
+        .await
+        .expect("put ok");
     assert_eq!(out.output, b"ok");
 
     let get_same_ctx = make_ctx("tenant-a", kv.clone(), Vec::new(), DEFAULT_MEM_CAP, true);
-    let out = invoke(
-        &engine,
-        &linker,
-        &component,
-        get_same_ctx,
-        b"kv:get:foo".to_vec(),
-        5_000,
-    )
-    .await
-    .expect("get ok");
+    let out = invoke(&engine, &pre, get_same_ctx, b"kv:get:foo".to_vec(), 5_000)
+        .await
+        .expect("get ok");
     assert_eq!(out.output, b"bar");
 
     let get_other_ctx = make_ctx("tenant-b", kv, Vec::new(), DEFAULT_MEM_CAP, true);
-    let out = invoke(
-        &engine,
-        &linker,
-        &component,
-        get_other_ctx,
-        b"kv:get:foo".to_vec(),
-        5_000,
-    )
-    .await
-    .expect("get ok");
+    let out = invoke(&engine, &pre, get_other_ctx, b"kv:get:foo".to_vec(), 5_000)
+        .await
+        .expect("get ok");
     assert_eq!(out.output, b"none");
 }
 
 #[tokio::test]
 async fn log_emit_returns_ok() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
-    let out = invoke(
-        &engine,
-        &linker,
-        &component,
-        ctx,
-        b"log:hello from a test".to_vec(),
-        5_000,
-    )
-    .await
-    .expect("invoke ok");
+    let out = invoke(&engine, &pre, ctx, b"log:hello from a test".to_vec(), 5_000)
+        .await
+        .expect("invoke ok");
     assert_eq!(out.output, b"ok");
 }
 
 #[tokio::test]
 async fn cpu_budget_traps_infinite_loop() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
     let started = Instant::now();
-    let err = invoke(&engine, &linker, &component, ctx, b"loop".to_vec(), 50)
+    let err = invoke(&engine, &pre, ctx, b"loop".to_vec(), 50)
         .await
         .expect_err("infinite loop should trap on cpu budget");
     let elapsed = started.elapsed();
@@ -205,7 +176,7 @@ async fn cpu_budget_traps_infinite_loop() {
 /// immediately.
 #[tokio::test(flavor = "current_thread")]
 async fn cooperative_yield_lets_other_tasks_run_during_loop() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx1 = make_ctx("tenant-a", kv.clone(), Vec::new(), DEFAULT_MEM_CAP, true);
     let ctx2 = make_ctx("tenant-b", kv, Vec::new(), DEFAULT_MEM_CAP, true);
@@ -216,22 +187,8 @@ async fn cooperative_yield_lets_other_tasks_run_during_loop() {
         Arc::new(std::sync::Mutex::new(None));
     let sleep_elapsed2 = sleep_elapsed.clone();
 
-    let loop1 = invoke(
-        &engine,
-        &linker,
-        &component,
-        ctx1,
-        b"loop".to_vec(),
-        loop_budget_ms,
-    );
-    let loop2 = invoke(
-        &engine,
-        &linker,
-        &component,
-        ctx2,
-        b"loop".to_vec(),
-        loop_budget_ms,
-    );
+    let loop1 = invoke(&engine, &pre, ctx1, b"loop".to_vec(), loop_budget_ms);
+    let loop2 = invoke(&engine, &pre, ctx2, b"loop".to_vec(), loop_budget_ms);
     let sleeper = async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
         *sleep_elapsed2.lock().unwrap() = Some(start.elapsed());
@@ -260,26 +217,19 @@ async fn cooperative_yield_lets_other_tasks_run_during_loop() {
 /// long before it could grow the in-memory KV store without bound.
 #[tokio::test]
 async fn kv_fill_traps_on_invocation_quota() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
-    let err = invoke(
-        &engine,
-        &linker,
-        &component,
-        ctx,
-        b"kv:fill".to_vec(),
-        5_000,
-    )
-    .await
-    .expect_err("unbounded kv writer should trap");
+    let err = invoke(&engine, &pre, ctx, b"kv:fill".to_vec(), 5_000)
+        .await
+        .expect_err("unbounded kv writer should trap");
     assert!(matches!(err, InvokeError::GuestTrap(_)), "got {err:?}");
 }
 
 #[tokio::test]
 async fn http_out_blocks_private_address_by_default() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     // `allow_private = false` this time — 127.0.0.1 must be refused even
     // though it's in the host allowlist, both because the client's own
@@ -296,7 +246,7 @@ async fn http_out_blocks_private_address_by_default() {
     let addr = spawn_raw_http_server(http_response("200 OK", b"hi", "")).await;
     let input = format!("fetch:http://{addr}/").into_bytes();
 
-    let out = invoke(&engine, &linker, &component, ctx, input, 5_000)
+    let out = invoke(&engine, &pre, ctx, input, 5_000)
         .await
         .expect("invoke ok — blocked address is a guest-visible error, not a trap");
     let text = String::from_utf8(out.output).unwrap();
@@ -309,12 +259,12 @@ async fn http_out_blocks_private_address_by_default() {
 
 #[tokio::test]
 async fn memory_cap_traps_runaway_allocator() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let cap = 16 * 1024 * 1024;
     let ctx = make_ctx("tenant-a", kv, Vec::new(), cap, true);
 
-    let err = invoke(&engine, &linker, &component, ctx, b"alloc".to_vec(), 5_000)
+    let err = invoke(&engine, &pre, ctx, b"alloc".to_vec(), 5_000)
         .await
         .expect_err("runaway allocator should trap on memory cap");
 
@@ -335,14 +285,13 @@ async fn memory_cap_traps_runaway_allocator() {
 
 #[tokio::test]
 async fn http_out_disallowed_host_is_rejected() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
     let out = invoke(
         &engine,
-        &linker,
-        &component,
+        &pre,
         ctx,
         b"fetch:http://example.invalid/".to_vec(),
         5_000,
@@ -356,7 +305,7 @@ async fn http_out_disallowed_host_is_rejected() {
 
 #[tokio::test]
 async fn http_out_allowed_host_returns_status_and_body() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx(
         "tenant-a",
@@ -369,7 +318,7 @@ async fn http_out_allowed_host_returns_status_and_body() {
     let addr = spawn_raw_http_server(http_response("200 OK", b"hi", "")).await;
     let input = format!("fetch:http://{addr}/").into_bytes();
 
-    let out = invoke(&engine, &linker, &component, ctx, input, 5_000)
+    let out = invoke(&engine, &pre, ctx, input, 5_000)
         .await
         .expect("invoke ok");
     assert_eq!(out.output, b"status:200:hi");
@@ -377,7 +326,7 @@ async fn http_out_allowed_host_returns_status_and_body() {
 
 #[tokio::test]
 async fn http_out_does_not_follow_redirects() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx(
         "tenant-a",
@@ -395,7 +344,7 @@ async fn http_out_does_not_follow_redirects() {
     .await;
     let input = format!("fetch:http://{addr}/").into_bytes();
 
-    let out = invoke(&engine, &linker, &component, ctx, input, 5_000)
+    let out = invoke(&engine, &pre, ctx, input, 5_000)
         .await
         .expect("invoke ok");
     let text = String::from_utf8(out.output).unwrap();
@@ -404,7 +353,7 @@ async fn http_out_does_not_follow_redirects() {
 
 #[tokio::test]
 async fn http_out_body_over_cap_is_rejected() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx(
         "tenant-a",
@@ -418,7 +367,7 @@ async fn http_out_body_over_cap_is_rejected() {
     let addr = spawn_raw_http_server(http_response("200 OK", &big_body, "")).await;
     let input = format!("fetch:http://{addr}/").into_bytes();
 
-    let out = invoke(&engine, &linker, &component, ctx, input, 5_000)
+    let out = invoke(&engine, &pre, ctx, input, 5_000)
         .await
         .expect("invoke ok — oversized body is a guest-visible error, not a trap");
     let text = String::from_utf8(out.output).unwrap();
@@ -427,11 +376,11 @@ async fn http_out_body_over_cap_is_rejected() {
 
 #[tokio::test]
 async fn guest_panic_traps() {
-    let (engine, linker, _ticker, component) = setup().await;
+    let (engine, pre, _ticker) = setup().await;
     let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
     let ctx = make_ctx("tenant-a", kv, Vec::new(), DEFAULT_MEM_CAP, true);
 
-    let err = invoke(&engine, &linker, &component, ctx, b"panic".to_vec(), 5_000)
+    let err = invoke(&engine, &pre, ctx, b"panic".to_vec(), 5_000)
         .await
         .expect_err("guest panic should trap");
     assert!(matches!(err, InvokeError::GuestTrap(_)), "got {err:?}");

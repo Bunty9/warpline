@@ -9,9 +9,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if ! rustup target list --installed | grep -q '^wasm32-wasip2$'; then
-    rustup target add wasm32-wasip2
-fi
+# Run inside examples/ so rustup resolves the pinned guest toolchain
+# (examples/rust-toolchain.toml), not the workspace's `stable`.
+(cd "$repo_root/examples" && rustup target add wasm32-wasip2 >/dev/null)
 
 for guest in hello-wasm test-guest; do
     echo "building examples/${guest}..."

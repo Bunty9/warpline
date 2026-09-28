@@ -62,8 +62,12 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins `stable` and would override the rustup
+      # default set above; force the MSRV explicitly.
       - name: cargo check --workspace
         run: cargo check --workspace
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
 
   deny:
     name: cargo-deny
@@ -95,17 +99,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Add wasm32-wasip2 target
-        run: rustup target add wasm32-wasip2
+      - name: Install the pinned guest toolchain (examples/rust-toolchain.toml)
+        working-directory: examples
+        run: rustup toolchain install
       - name: Build examples/{hello-wasm,test-guest} and refresh the test fixture
         run: ./scripts/build-guests.sh
       # `scripts/build-guests.sh` overwrites
       # crates/core/tests/fixtures/test_guest.wasm from a fresh build of
       # examples/test-guest. Verified locally (two clean `cargo build
       # --release --target wasm32-wasip2` runs of examples/test-guest) that
-      # the output is byte-for-byte reproducible on this toolchain, so a
+      # the output is byte-for-byte reproducible on the toolchain pinned in
+      # examples/rust-toolchain.toml, so a
       # diff here means the committed fixture is stale relative to
       # examples/test-guest's source and needs `./scripts/build-guests.sh`
       # run and committed.

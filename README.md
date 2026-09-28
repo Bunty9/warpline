@@ -25,7 +25,8 @@ talk about.
 Two axum services share one on-disk module registry and one Postgres
 database; the host's Prometheus scrape endpoint runs on a second,
 loopback-only listener so it never shares a socket with whatever's publicly
-reachable.
+reachable. On Fly (one machine, one volume) the host runs both APIs in one
+process via `WARPLINE_EMBED_CONTROL=1`.
 
 ```
                          +----------------------+
@@ -172,7 +173,9 @@ loaded into. The compat hash narrows that gap; `load_cwasm` additionally
 rejects any digest that isn't exactly 64 lowercase hex characters before it
 ever builds a path, so a digest can't be used to escape the cache
 directory. The cache directory is otherwise treated as host-trusted local
-storage, written only by the control plane.
+storage, written by the control plane on upload and by the host when it
+recompiles a missing or engine-incompatible `.cwasm` from the stored source
+`.wasm` — so both need write access to the modules volume.
 
 ### `http-out`: allowlist, not open egress
 
@@ -265,11 +268,13 @@ Every environment variable either binary reads, with its default:
 | -------------------------------- | ---------------- | ------------------------------------------------------- | ------- |
 | `DATABASE_URL`                  | host, control    | unset (refuses to start unless `WARPLINE_INSECURE_DEV=1`) | Postgres connection string. Enables auth, tenant config, and metering; runs migrations on boot. |
 | `WARPLINE_INSECURE_DEV`         | host, control    | unset                                                    | Set to `1` to run without Postgres: no auth enforced, every tenant gets `TenantConfig::dev_default` (empty allowlist, 100 ms CPU, 64 MiB memory), invocations are logged at debug level instead of metered. Not for production. |
-| `WARPLINE_ADMIN_TOKEN`          | control          | unset (`/admin/tenants/{tenant}` 404s)                   | Bearer token guarding the admin route. |
+| `WARPLINE_ADMIN_TOKEN`          | control (host if embedded) | unset (`/admin/tenants/{tenant}` 404s)                   | Bearer token guarding the admin route. |
 | `WARPLINE_MODULES_DIR`          | host, control    | `./modules`                                              | Root of the shared module registry (`wasm/`, `cwasm/`, `tenants/`). |
 | `WARPLINE_HOST_BIND`            | host             | `127.0.0.1:8080` under `WARPLINE_INSECURE_DEV`, else `0.0.0.0:8080` | `warpline-host`'s invoke-API listen address. |
-| `WARPLINE_CONTROL_BIND`         | control          | `127.0.0.1:8081` under `WARPLINE_INSECURE_DEV`, else `0.0.0.0:8081` | `warpline-control`'s listen address. |
+| `WARPLINE_CONTROL_BIND`         | control (host if embedded) | `127.0.0.1:8081` under `WARPLINE_INSECURE_DEV`, else `0.0.0.0:8081` | `warpline-control`'s listen address. |
 | `WARPLINE_METRICS_BIND`         | host             | `127.0.0.1:9090`                                         | Separate `/metrics` listener — never on the main router (would leak per-tenant series to whatever's publicly reachable). |
+| `WARPLINE_AUTH_CACHE_TTL_SECS`  | host, control    | `30` (`0` disables)                                      | TTL of the in-process API-key lookup cache (positive and negative results). Key revocation and tenant config changes take up to this long to apply. |
+| `WARPLINE_EMBED_CONTROL`        | host             | unset                                                    | Set to `1` to also serve the control-plane API from the host process (same engine, same volume), and run the startup blob GC there. Used by `fly.toml`, since a Fly volume attaches to one machine. |
 | `WARPLINE_ALLOW_PRIVATE_EGRESS` | host             | unset (`false`)                                          | Set to `1` to let `http-out` reach loopback/private/link-local addresses (local dev only). |
 | `WARPLINE_TEST_DATABASE_URL`    | tests only       | unset (DB-backed tests skip themselves)                  | Postgres URL for `crates/{host,control}/tests/db_mode.rs`. |
 
@@ -321,7 +326,8 @@ Every environment variable either binary reads, with its default:
 - **`GET /metrics`** — on `WARPLINE_METRICS_BIND` (default
   `127.0.0.1:9090`), a separate `axum::serve` listener, not on the router
   above. Prometheus text exposition; includes `warpline_invoke_duration_us`
-  and `warpline_invoke_total` (labeled by tenant/func/outcome) and
+  (labeled by tenant), `warpline_invoke_total` (labeled by
+  tenant/func/outcome) and
   `warpline_meter_dropped_total`.
 
 ## Writing a guest

@@ -1,0 +1,8 @@
+# Guests are pinned so `crates/core/tests/fixtures/test_guest.wasm` stays
+# byte-reproducible: rustc/LLVM output changes between releases, and CI
+# diffs a fresh build against the committed fixture. Bump deliberately and
+# re-run `scripts/build-guests.sh` in the same commit.
+[toolchain]
+channel = "1.98.0"
+targets = ["wasm32-wasip2"]
+profile = "minimal"

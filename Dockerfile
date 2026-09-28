@@ -15,19 +15,34 @@ COPY --from=planner /app/recipe.json recipe.json
 # Cook the dependency layer first — this is the cargo-chef speedup.
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
+# wit/ dir is needed for bindgen! at compile time
 RUN cargo build --release --bin warpline-host --bin warpline-control
+# Pre-create the modules dir owned by distroless `nonroot` (65532): a fresh
+# named volume copies this ownership, otherwise it is root-owned and the
+# non-root binaries can't write to it.
+RUN mkdir -p /out/var/lib/warpline/modules
+
+# ---- Stage 4a: root runtime for Fly -----------------------------------------
+# Fly volumes are fresh root-owned filesystems and distroless has no shell to
+# chown them at start, so fly.toml selects this target (`build-target`).
+# Everything else uses the non-root default stage below.
+FROM gcr.io/distroless/cc-debian12 AS runtime-root
+COPY --from=builder /app/target/release/warpline-host /usr/local/bin/warpline-host
+COPY --from=builder /app/target/release/warpline-control /usr/local/bin/warpline-control
+EXPOSE 8080 8081
+ENTRYPOINT ["/usr/local/bin/warpline-host"]
 
 # ---- Stage 4: distroless runtime --------------------------------------------
 # NOT scratch: wasmtime links libc + libgcc_s for the cranelift JIT. Distroless
 # `cc` ships both, plus ca-certs for outbound HTTPS (the http-out capability,
 # wired in Phase 2). Image size: ~70 MiB vs ~5 MiB scratch — the right
 # tradeoff for a wasm host where the wasmtime runtime dominates anyway.
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/warpline-host /usr/local/bin/warpline-host
 COPY --from=builder /app/target/release/warpline-control /usr/local/bin/warpline-control
-COPY migrations /app/migrations
+COPY --from=builder --chown=65532:65532 /out/var/lib/warpline /var/lib/warpline
 EXPOSE 8080 8081
 # Default entrypoint is the host; docker-compose overrides for the control
-# plane.
+# plane. Migrations are embedded at compile time via sqlx::migrate!.
 ENTRYPOINT ["/usr/local/bin/warpline-host"]

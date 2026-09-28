@@ -48,9 +48,12 @@ use warpline_core::{
 /// Multipart upload size cap.
 const UPLOAD_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Per-tenant cap on distinct function names (finding 3) — also bounds the
-/// cardinality of the `func` label a tenant can push into metrics/logs.
-const MAX_FUNCTIONS_PER_TENANT: i64 = 100;
+/// Default per-tenant cap on distinct function names (finding 3) — also
+/// bounds the cardinality of the `func` label a tenant can push into
+/// metrics/logs. A field on [`AppState`] rather than a bare constant so
+/// tests can override it to a small number and exercise the quota boundary
+/// without uploading 100 real functions.
+const DEFAULT_MAX_FUNCTIONS_PER_TENANT: i64 = 100;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +68,11 @@ pub struct AppState {
     /// 2) — a burst of uploads shouldn't be able to spin up an unbounded
     /// number of full cranelift passes at once.
     pub compile_semaphore: Arc<Semaphore>,
+    /// Per-tenant cap on distinct function names, see
+    /// [`DEFAULT_MAX_FUNCTIONS_PER_TENANT`]. A field (not that constant
+    /// directly) so tests can dial it down and exercise the quota boundary
+    /// cheaply.
+    pub max_functions_per_tenant: i64,
 }
 
 impl AppState {
@@ -84,6 +92,7 @@ impl AppState {
             db,
             admin_token,
             compile_semaphore: Arc::new(Semaphore::new(permits)),
+            max_functions_per_tenant: DEFAULT_MAX_FUNCTIONS_PER_TENANT,
         }
     }
 }
@@ -264,13 +273,29 @@ async fn upload(
 
 /// Publish `(tenant, func)` -> `wasm_digest`.
 ///
-/// In DB mode (finding 10): one transaction takes a per-`(tenant, func)`
-/// advisory lock, enforces [`MAX_FUNCTIONS_PER_TENANT`] (finding 3),
-/// upserts the `functions` row, and only then writes the pointer file,
-/// before committing — so a quota rejection or any DB failure never leaves
-/// a pointer behind that the control plane's own bookkeeping doesn't know
-/// about, and a concurrent upload of the same `(tenant, func)` can't race
-/// the quota check against itself.
+/// In DB mode (finding 10): one transaction takes a per-*tenant* advisory
+/// lock, enforces [`AppState::max_functions_per_tenant`] (finding 3), and
+/// upserts the `functions` row — all before committing, so a quota
+/// rejection or any DB failure never leaves a `functions` row behind that
+/// the pointer file doesn't back.
+///
+/// The lock is keyed on `tenant` alone, not `(tenant, func)` (finding 5):
+/// two concurrent uploads of two different *new* function names for the
+/// same tenant must serialize against each other too, or both can read the
+/// same `count(*)` before either inserts and both pass the quota check —
+/// only a lock that's shared across every upload for a tenant closes that
+/// race.
+///
+/// The pointer file is written *after* `tx.commit()`, not before (finding
+/// 6): the advisory lock is released at commit, so a concurrent upload of
+/// the *same* `(tenant, func)` could in principle commit its own
+/// `functions` row and then race this one on the pointer write — acceptable,
+/// last writer wins, and it's the same outcome a sequential re-upload would
+/// have anyway. Writing the pointer post-commit instead means a commit
+/// failure (or a crash between the two) never leaves a pointer that serves
+/// new code without a `functions` row backing it; the reverse case (a row
+/// with no pointer yet) just 404s until the write is retried, which is the
+/// harmless direction to fail in.
 ///
 /// In `InsecureDev` (no database, no tenant id), there is nothing to lock
 /// or upsert against, so this just writes the pointer.
@@ -306,14 +331,16 @@ async fn publish_pointer(
         .await
         .map_err(|e| internal_error(e, "failed to start publish transaction"))?;
 
-    // Serialize concurrent uploads of the same (tenant, func) so the quota
-    // check below can't race with itself.
+    // Serialize concurrent uploads for the same *tenant* (not just the same
+    // func — see doc comment above) so the quota check below can't race
+    // with itself.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-        .bind(format!("{tenant}/{func}"))
+        .bind(tenant)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal_error(e, "failed to take publish lock"))?;
 
+    let max_functions = state.max_functions_per_tenant;
     let other_functions: i64 =
         sqlx::query_scalar("SELECT count(*) FROM functions WHERE tenant_id = $1 AND name <> $2")
             .bind(tenant_id)
@@ -321,12 +348,12 @@ async fn publish_pointer(
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal_error(e, "failed to check function quota"))?;
-    if other_functions >= MAX_FUNCTIONS_PER_TENANT {
+    if other_functions >= max_functions {
         // `tx` drops here without a commit, rolling back the advisory lock
         // release included.
         return Err((
             StatusCode::FORBIDDEN,
-            format!("tenant function quota exceeded ({MAX_FUNCTIONS_PER_TENANT} max)"),
+            format!("tenant function quota exceeded ({max_functions} max)"),
         ));
     }
 
@@ -341,6 +368,13 @@ async fn publish_pointer(
     .await
     .map_err(|e| internal_error(e, "failed to upsert functions row"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(e, "failed to commit publish transaction"))?;
+
+    // Written after the commit, not before (finding 6) — see doc comment
+    // above for why that ordering is the one that can't leave a pointer
+    // serving code the `functions` table doesn't know about.
     registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(|e| {
         tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
         (
@@ -348,10 +382,6 @@ async fn publish_pointer(
             "failed to publish module".to_string(),
         )
     })?;
-
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(e, "failed to commit publish transaction"))?;
 
     Ok(())
 }
