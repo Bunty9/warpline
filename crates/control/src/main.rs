@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use warpline_control::{router, AppState};
 use warpline_core::{
     auth::DbState,
+    registry,
     runtime::{build_engine, build_linker},
 };
 
@@ -22,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let db = DbState::connect().await?;
+    let insecure_dev = matches!(db, DbState::InsecureDev);
     let engine = build_engine()?;
     let linker = build_linker(&engine)?;
     let modules_dir = std::env::var("WARPLINE_MODULES_DIR")
@@ -29,11 +31,25 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("./modules"));
     std::fs::create_dir_all(&modules_dir)?;
 
+    // Run once, before serving: clean up any wasm/cwasm blob no pointer
+    // references (finding 3) — e.g. left behind by a crash between
+    // persisting a blob and writing its pointer.
+    match registry::gc_unreferenced_blobs(&modules_dir) {
+        Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
+        Err(e) => tracing::warn!(error = %e, "startup GC failed"),
+    }
+
     let state = AppState::new(engine, linker, modules_dir, db);
     let app = router(state);
 
-    let bind =
-        std::env::var("WARPLINE_CONTROL_BIND").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    // InsecureDev has no auth in front of it; don't default to a
+    // publicly-reachable bind in that mode (finding 8).
+    let default_bind = if insecure_dev {
+        "127.0.0.1:8081"
+    } else {
+        "0.0.0.0:8081"
+    };
+    let bind = std::env::var("WARPLINE_CONTROL_BIND").unwrap_or_else(|_| default_bind.to_string());
     tracing::info!(%bind, "warpline-control starting");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;

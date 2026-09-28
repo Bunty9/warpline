@@ -1,17 +1,19 @@
 //! `warpline-control` — control plane HTTP API.
 //!
 //! - `POST /tenants/{tenant}/functions/{func}` accepts a multipart `.wasm`
-//!   upload (field `wasm`/`module`/`file`), compiles it to `.cwasm` via
-//!   `warpline_core::cache::load_or_compile` under a shared content-hash
-//!   cache dir (`spawn_blocking`, since compilation is CPU-heavy), type-
-//!   checks its imports/exports against the linker
+//!   upload (field `wasm`/`module`/`file`), compiles it (`spawn_blocking`,
+//!   under a process-wide semaphore — compilation is CPU-heavy and
+//!   otherwise unbounded concurrency here is a DoS vector), type-checks its
+//!   imports/exports against the linker
 //!   (`warpline_core::runtime::typecheck_component`) so a bad component is
-//!   rejected here rather than at invoke time, writes the `(tenant, func)`
-//!   pointer file (`warpline_core::registry::write_pointer`), and upserts
-//!   the `functions` row when a database is configured.
+//!   rejected here rather than at invoke time, and only *then* persists the
+//!   source `.wasm` + compiled `.cwasm` and publishes the `(tenant, func)`
+//!   pointer — in DB mode, inside one transaction that also enforces the
+//!   per-tenant function quota (see [`publish_pointer`]).
 //! - `POST /admin/tenants/{tenant}` (guarded by `WARPLINE_ADMIN_TOKEN`)
 //!   creates a tenant idempotently, optionally sets its resource config,
-//!   and issues a new API key.
+//!   and issues a new API key — tenant upsert, config update and key insert
+//!   all happen in one transaction.
 //! - `GET /healthz`.
 //!
 //! Split into this lib (state + [`router`]) and a thin `main.rs` so
@@ -19,6 +21,7 @@
 //! `tower::ServiceExt::oneshot` without a real listening socket.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
@@ -28,12 +31,13 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use wasmtime::component::Linker;
+use tokio::sync::Semaphore;
+use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
 use warpline_core::{
     auth::{authenticate, parse_bearer, AuthOutcome, DbState},
-    cache::{digest, load_or_compile},
+    cache::{self, digest},
     registry,
     runtime::typecheck_component,
     types::{
@@ -44,6 +48,10 @@ use warpline_core::{
 /// Multipart upload size cap.
 const UPLOAD_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Per-tenant cap on distinct function names (finding 3) — also bounds the
+/// cardinality of the `func` label a tenant can push into metrics/logs.
+const MAX_FUNCTIONS_PER_TENANT: i64 = 100;
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Engine,
@@ -53,6 +61,10 @@ pub struct AppState {
     /// `WARPLINE_ADMIN_TOKEN`, or `None` if unset — the admin route is
     /// disabled (404) in that case.
     pub admin_token: Option<String>,
+    /// Bounds concurrent `spawn_blocking` compiles process-wide (finding
+    /// 2) — a burst of uploads shouldn't be able to spin up an unbounded
+    /// number of full cranelift passes at once.
+    pub compile_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -60,12 +72,18 @@ impl AppState {
         let admin_token = std::env::var("WARPLINE_ADMIN_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
+        let permits = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            / 2)
+        .max(1);
         Self {
             engine,
             linker,
             modules_dir,
             db,
             admin_token,
+            compile_semaphore: Arc::new(Semaphore::new(permits)),
         }
     }
 }
@@ -116,7 +134,7 @@ async fn upload(
         }
     };
 
-    let mut wasm_bytes: Option<Vec<u8>> = None;
+    let mut wasm_bytes: Option<Bytes> = None;
     loop {
         // `MultipartError::status` already distinguishes a body over the
         // `DefaultBodyLimit` (413) from a malformed multipart body (400) —
@@ -129,7 +147,10 @@ async fn upload(
         let name = field.name().unwrap_or("").to_string();
         if name == "wasm" || name == "module" || name == "file" {
             match field.bytes().await {
-                Ok(b) => wasm_bytes = Some(b.to_vec()),
+                // Keep the zero-copy `Bytes` handle rather than `.to_vec()`
+                // — cloning it below is a refcount bump, not a memcpy
+                // (finding 2).
+                Ok(b) => wasm_bytes = Some(b),
                 Err(e) => return (e.status(), format!("read field failed: {e}")).into_response(),
             }
         }
@@ -138,17 +159,28 @@ async fn upload(
         return (StatusCode::BAD_REQUEST, "missing wasm field".to_string()).into_response();
     };
 
+    // Bound concurrent compiles process-wide (finding 2): held across the
+    // whole `spawn_blocking` call below, not just while acquiring it.
+    let Ok(permit) = state.compile_semaphore.clone().acquire_owned().await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+            .into_response();
+    };
+
     let cwasm_dir = registry::cwasm_dir(&state.modules_dir);
     let engine = state.engine.clone();
     let wasm_for_compile = wasm.clone();
-    // Compilation is CPU-heavy (a full cranelift pass on a cache miss) —
-    // keep it off the async runtime's worker threads.
     let compiled = tokio::task::spawn_blocking(move || {
-        load_or_compile(&engine, &wasm_for_compile, &cwasm_dir)
+        let _permit = permit;
+        cache::compile(&engine, &wasm_for_compile, &cwasm_dir)
     })
     .await;
-    let component = match compiled {
-        Ok(Ok(c)) => c,
+    let (component, wasm_digest): (Component, String) = match compiled {
+        // The freshness bool isn't needed here — the component always gets
+        // persisted below, unconditionally, once it's passed the typecheck.
+        Ok(Ok((component, digest, _freshly_compiled))) => (component, digest),
         Ok(Err(e)) => {
             tracing::warn!(%tenant, %func, error = %e, "component compile/parse failed");
             return (
@@ -178,29 +210,44 @@ async fn upload(
             .into_response();
     }
 
-    let wasm_digest = digest(&wasm);
-    if let Err(e) = registry::write_pointer(&state.modules_dir, &tenant, &func, &wasm_digest) {
-        tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to publish module".to_string(),
-        )
-            .into_response();
+    // Only a typechecked component's bytes get persisted (finding 3): an
+    // upload that compiles but fails the typecheck never leaves a
+    // wasm/cwasm blob behind for the GC pass to have to clean up later.
+    let cwasm_dir = registry::cwasm_dir(&state.modules_dir);
+    let modules_dir = state.modules_dir.clone();
+    let engine = state.engine.clone();
+    let wasm_for_persist = wasm.clone();
+    let digest_for_persist = wasm_digest.clone();
+    let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        cache::persist_cwasm(&component, &engine, &cwasm_dir, &digest_for_persist)?;
+        registry::write_wasm_source(&modules_dir, &digest_for_persist, &wasm_for_persist)?;
+        Ok(())
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(%tenant, %func, error = %e, "failed to persist compiled module");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to publish module".to_string(),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(%tenant, %func, error = %e, "persist task panicked");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+                .into_response();
+        }
     }
 
-    if let (DbState::Postgres(pool), Some(tenant_id)) = (&state.db, authed.id) {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO functions (tenant_id, name, wasm_hash) VALUES ($1, $2, $3) \
-             ON CONFLICT (tenant_id, name) DO UPDATE SET wasm_hash = EXCLUDED.wasm_hash",
-        )
-        .bind(tenant_id)
-        .bind(&func)
-        .bind(&wasm_digest)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!(%tenant, %func, error = %e, "failed to upsert functions row");
-        }
+    if let Err((status, msg)) =
+        publish_pointer(&state, &tenant, &func, authed.id, &wasm_digest).await
+    {
+        return (status, msg).into_response();
     }
 
     tracing::info!(%tenant, %func, digest = %wasm_digest, "module compiled and published");
@@ -213,6 +260,100 @@ async fn upload(
         })),
     )
         .into_response()
+}
+
+/// Publish `(tenant, func)` -> `wasm_digest`.
+///
+/// In DB mode (finding 10): one transaction takes a per-`(tenant, func)`
+/// advisory lock, enforces [`MAX_FUNCTIONS_PER_TENANT`] (finding 3),
+/// upserts the `functions` row, and only then writes the pointer file,
+/// before committing — so a quota rejection or any DB failure never leaves
+/// a pointer behind that the control plane's own bookkeeping doesn't know
+/// about, and a concurrent upload of the same `(tenant, func)` can't race
+/// the quota check against itself.
+///
+/// In `InsecureDev` (no database, no tenant id), there is nothing to lock
+/// or upsert against, so this just writes the pointer.
+async fn publish_pointer(
+    state: &AppState,
+    tenant: &str,
+    func: &str,
+    tenant_id: Option<uuid::Uuid>,
+    wasm_digest: &str,
+) -> Result<(), (StatusCode, String)> {
+    let (DbState::Postgres(pool), Some(tenant_id)) = (&state.db, tenant_id) else {
+        return registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(
+            |e| {
+                tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to publish module".to_string(),
+                )
+            },
+        );
+    };
+
+    let internal_error = |e: sqlx::Error, action: &str| {
+        tracing::error!(%tenant, %func, error = %e, "{action}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    };
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| internal_error(e, "failed to start publish transaction"))?;
+
+    // Serialize concurrent uploads of the same (tenant, func) so the quota
+    // check below can't race with itself.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("{tenant}/{func}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal_error(e, "failed to take publish lock"))?;
+
+    let other_functions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM functions WHERE tenant_id = $1 AND name <> $2")
+            .bind(tenant_id)
+            .bind(func)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| internal_error(e, "failed to check function quota"))?;
+    if other_functions >= MAX_FUNCTIONS_PER_TENANT {
+        // `tx` drops here without a commit, rolling back the advisory lock
+        // release included.
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("tenant function quota exceeded ({MAX_FUNCTIONS_PER_TENANT} max)"),
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO functions (tenant_id, name, wasm_hash) VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, name) DO UPDATE SET wasm_hash = EXCLUDED.wasm_hash",
+    )
+    .bind(tenant_id)
+    .bind(func)
+    .bind(wasm_digest)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| internal_error(e, "failed to upsert functions row"))?;
+
+    registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(|e| {
+        tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to publish module".to_string(),
+        )
+    })?;
+
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(e, "failed to commit publish transaction"))?;
+
+    Ok(())
 }
 
 /// `POST /admin/tenants/{tenant}` request body — every field optional, so a
@@ -270,11 +411,17 @@ async fn admin_create_tenant(
             }
         }
     };
-    if let Some(hosts) = &cfg.allowed_hosts {
-        if let Err(e) = validate_allowed_hosts(hosts) {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    }
+    // Normalized (lowercased, trailing-dot-trimmed) form is what gets
+    // stored — see `validate_allowed_hosts` (finding 9): storing the raw
+    // input would let an allowlist entry silently never match the
+    // already-normalized host `http-out::fetch` compares it against.
+    let normalized_hosts: Option<Vec<String>> = match &cfg.allowed_hosts {
+        Some(hosts) => match validate_allowed_hosts(hosts) {
+            Ok(v) => Some(v),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        },
+        None => None,
+    };
     if let Some(ms) = cfg.cpu_budget_ms {
         if let Err(e) = validate_cpu_budget_ms(ms) {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -284,50 +431,6 @@ async fn admin_create_tenant(
         if let Err(e) = validate_mem_cap_bytes(b) {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
-    }
-
-    // Idempotent create: `RETURNING id` fires whether this insert created
-    // the row or the ON CONFLICT arm did.
-    let tenant_id: uuid::Uuid = match sqlx::query_scalar(
-        "INSERT INTO tenants (name) VALUES ($1) \
-         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
-         RETURNING id",
-    )
-    .bind(&tenant)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!(%tenant, error = %e, "failed to upsert tenant");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
-            )
-                .into_response();
-        }
-    };
-
-    if let Err(e) = sqlx::query(
-        "UPDATE tenants SET \
-            allowed_hosts = COALESCE($2, allowed_hosts), \
-            cpu_budget_ms = COALESCE($3, cpu_budget_ms), \
-            mem_cap_bytes = COALESCE($4, mem_cap_bytes) \
-         WHERE id = $1",
-    )
-    .bind(tenant_id)
-    .bind(cfg.allowed_hosts)
-    .bind(cfg.cpu_budget_ms.map(|v| v as i32))
-    .bind(cfg.mem_cap_bytes)
-    .execute(pool)
-    .await
-    {
-        tracing::error!(%tenant, error = %e, "failed to update tenant config");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        )
-            .into_response();
     }
 
     let mut key_bytes = [0u8; 32];
@@ -342,26 +445,63 @@ async fn admin_create_tenant(
     let api_key = format!("wl_{}", hex::encode(key_bytes));
     let key_hash = digest(api_key.as_bytes());
 
-    if let Err(e) = sqlx::query("INSERT INTO api_keys (key_hash, tenant_id) VALUES ($1, $2)")
-        .bind(&key_hash)
-        .bind(tenant_id)
-        .execute(pool)
-        .await
-    {
-        tracing::error!(%tenant, error = %e, "failed to insert api key");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
+    // Tenant upsert + config update + key insert as one unit (finding 11):
+    // a failure partway through must not leave e.g. a tenant row with no
+    // usable key, or a key issued against a config update that never
+    // landed.
+    let result: Result<(), sqlx::Error> = async {
+        let mut tx = pool.begin().await?;
+        let tenant_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (name) VALUES ($1) \
+             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
+             RETURNING id",
         )
-            .into_response();
-    }
+        .bind(&tenant)
+        .fetch_one(&mut *tx)
+        .await?;
 
-    tracing::info!(%tenant, "tenant created/updated, api key issued");
-    (
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({ "tenant": tenant, "api_key": api_key })),
-    )
-        .into_response()
+        sqlx::query(
+            "UPDATE tenants SET \
+                allowed_hosts = COALESCE($2, allowed_hosts), \
+                cpu_budget_ms = COALESCE($3, cpu_budget_ms), \
+                mem_cap_bytes = COALESCE($4, mem_cap_bytes) \
+             WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .bind(&normalized_hosts)
+        .bind(cfg.cpu_budget_ms.map(|v| v as i32))
+        .bind(cfg.mem_cap_bytes)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO api_keys (key_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&key_hash)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            tracing::info!(%tenant, "tenant created/updated, api key issued");
+            (
+                StatusCode::CREATED,
+                axum::Json(serde_json::json!({ "tenant": tenant, "api_key": api_key })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%tenant, error = %e, "failed to create/update tenant");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

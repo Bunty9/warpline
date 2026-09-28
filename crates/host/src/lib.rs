@@ -11,6 +11,10 @@
 //! Split into this lib (state + [`router`]) and a thin `main.rs` so
 //! `crates/host/tests/` can drive the whole app through
 //! `tower::ServiceExt::oneshot` without a real listening socket.
+//!
+//! `/metrics` is deliberately not on [`router`] — see [`metrics_router`] —
+//! since it exposes per-tenant series and shouldn't share a listener with
+//! whatever's publicly reachable.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -31,6 +35,7 @@ use wasmtime::Engine;
 use warpline_core::{
     auth::{authenticate, parse_bearer, AuthOutcome, DbState},
     kv::KvStore,
+    meter::{MeterMsg, MeterSender},
     registry::{self, ComponentCache},
     runtime::{invoke, EpochTicker, InvokeError, InvokeOutcome},
     types::{valid_name, HostCtx},
@@ -54,6 +59,10 @@ pub struct AppState {
     /// Keeps the engine's epoch-ticker thread alive for the process
     /// lifetime; never read, only held.
     pub ticker: Arc<EpochTicker>,
+    /// Sender half of the bounded metering channel — see
+    /// `warpline_core::meter`. Cloning is cheap; every request handler gets
+    /// its own clone via [`AppState`].
+    pub meter_tx: MeterSender,
 }
 
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -79,12 +88,22 @@ pub fn router(state: AppState) -> Router {
             post(invoke_handler).layer(DefaultBodyLimit::max(INVOKE_BODY_LIMIT_BYTES)),
         )
         .route("/healthz", get(|| async { "ok" }))
-        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    state.metrics_handle.render()
+async fn metrics_handler(State(handle): State<PrometheusHandle>) -> impl IntoResponse {
+    handle.render()
+}
+
+/// `/metrics` on its own router, with its own `PrometheusHandle` state
+/// rather than the full [`AppState`] — meant to be served on a separate
+/// listener (`WARPLINE_METRICS_BIND`, default loopback-only; see
+/// `main.rs`) so a scrape endpoint reachable from wherever `/invoke` is
+/// doesn't also leak tenant/function names (finding 6).
+pub fn metrics_router(metrics_handle: PrometheusHandle) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .with_state(metrics_handle)
 }
 
 /// Outcome label for the `warpline_invoke_total` counter.
@@ -132,12 +151,14 @@ async fn invoke_handler(
     };
 
     let component = match registry::resolve(
-        &state.engine,
-        &state.component_cache,
-        &state.modules_dir,
-        &tenant,
-        &func,
-    ) {
+        state.engine.clone(),
+        state.component_cache.clone(),
+        state.modules_dir.clone(),
+        tenant.clone(),
+        func.clone(),
+    )
+    .await
+    {
         Ok(Some(c)) => c,
         Ok(None) => {
             return (
@@ -178,10 +199,14 @@ async fn invoke_handler(
     .await;
     let wall_us = wall_started.elapsed().as_micros() as u64;
 
+    // `func` dropped from the histogram's labels (finding 7): the
+    // per-tenant function quota (finding 3, `warpline-control`) bounds how
+    // many distinct `func` values a tenant can create, but not how many
+    // tenants there are, so keeping `func` off a metric every tenant
+    // contributes to avoids multiplying that cardinality further.
     metrics::histogram!(
         "warpline_invoke_duration_us",
-        "tenant" => tenant.clone(),
-        "func" => func.clone()
+        "tenant" => tenant.clone()
     )
     .record(match &result {
         Ok(o) => o.cpu_us as f64,
@@ -203,36 +228,21 @@ async fn invoke_handler(
         Err(InvokeError::MemoryCapExceeded { peak_bytes, .. }) => (wall_us, *peak_bytes, false),
         Err(_) => (wall_us, 0, false),
     };
-    let db = state.db.clone();
-    let meter_tenant = tenant.clone();
-    let meter_func = func.clone();
-    tokio::spawn(async move {
-        match &db {
-            DbState::Postgres(pool) => {
-                if let Err(e) = warpline_core::meter::record(
-                    pool,
-                    &meter_tenant,
-                    &meter_func,
-                    cpu_us,
-                    mem_peak_bytes,
-                    ok,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        tenant = %meter_tenant, func = %meter_func, error = %e,
-                        "failed to write meter row"
-                    );
-                }
-            }
-            DbState::InsecureDev => {
-                tracing::debug!(
-                    tenant = %meter_tenant, func = %meter_func, cpu_us, mem_peak_bytes, ok,
-                    "invoke completed (metering disabled: WARPLINE_INSECURE_DEV)"
-                );
-            }
-        }
-    });
+    // Queued onto the bounded metering channel rather than a per-invoke
+    // `tokio::spawn` (finding 5): a burst of invokes no longer spawns one
+    // task + one Postgres write per request. A full channel means this row
+    // is dropped, counted via `warpline_meter_dropped_total`, rather than
+    // blocking the response or growing the channel without bound.
+    let row = MeterMsg {
+        tenant: tenant.clone(),
+        func: func.clone(),
+        cpu_us,
+        mem_peak_bytes,
+        ok,
+    };
+    if state.meter_tx.try_send(row).is_err() {
+        metrics::counter!("warpline_meter_dropped_total").increment(1);
+    }
 
     match result {
         Ok(outcome) => (StatusCode::OK, outcome.output).into_response(),

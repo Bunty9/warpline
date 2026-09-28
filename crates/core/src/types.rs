@@ -76,16 +76,29 @@ pub fn validate_mem_cap_bytes(v: i64) -> Result<(), ConfigError> {
 /// A "plausible hostname" is anything `url::Host::parse` accepts — a
 /// domain name or an IP literal, both of which `http-out::fetch`'s
 /// allowlist check (`runtime::http_fetch`) compares against verbatim.
-pub fn validate_allowed_hosts(hosts: &[String]) -> Result<(), ConfigError> {
+///
+/// Returns the *normalized* form of each host (lowercased, trailing
+/// root-label dot trimmed) rather than echoing back what was submitted —
+/// `runtime::http_fetch` compares a request's already-normalized host
+/// against whatever was stored here, so storing the raw, unnormalized
+/// input (e.g. `API.Example.com.`) would silently make the allowlist
+/// entry never match. Callers (`warpline-control`'s admin route) persist
+/// the returned `Vec<String>`, not the input.
+pub fn validate_allowed_hosts(hosts: &[String]) -> Result<Vec<String>, ConfigError> {
     if hosts.len() > MAX_ALLOWED_HOSTS {
         return Err(ConfigError::TooManyHosts);
     }
-    for h in hosts {
-        if url::Host::parse(h).is_err() {
-            return Err(ConfigError::InvalidHost(h.clone()));
-        }
-    }
-    Ok(())
+    hosts
+        .iter()
+        .map(|h| {
+            let host = url::Host::parse(h).map_err(|_| ConfigError::InvalidHost(h.clone()))?;
+            Ok(host
+                .to_string()
+                .to_lowercase()
+                .trim_end_matches('.')
+                .to_string())
+        })
+        .collect()
 }
 
 /// Per-invocation host context. See module docs.
@@ -302,6 +315,12 @@ mod tests {
         );
         assert!(validate_allowed_hosts(&["not a host".to_string()]).is_err());
         assert!(validate_allowed_hosts(&vec!["a.com".to_string(); 65]).is_err());
+    }
+
+    #[test]
+    fn validate_allowed_hosts_normalizes_case_and_trailing_dot() {
+        let normalized = validate_allowed_hosts(&["API.Example.com.".to_string()]).unwrap();
+        assert_eq!(normalized, vec!["api.example.com".to_string()]);
     }
 
     #[test]

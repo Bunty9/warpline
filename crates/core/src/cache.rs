@@ -113,25 +113,54 @@ pub fn load_cwasm(engine: &Engine, cache_dir: &Path, digest: &str) -> anyhow::Re
     unsafe { Ok(Component::deserialize(engine, &bytes)?) }
 }
 
+/// Write `bytes` to `dest` (which must be a file directly inside `dir`)
+/// atomically: same-directory temp file (so the final rename is
+/// same-filesystem) + `sync_all` before publishing, so a concurrent reader
+/// never sees a truncated file and a crash between write and rename never
+/// leaves a corrupt file at the published path. Shared by every writer of
+/// content-addressed storage under `modules_dir` (`.cwasm` cache, source
+/// `.wasm` blobs, `registry`'s pointer files).
+pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    // NamedTempFile is 0600; the host may run as a different user than the
+    // control plane, so publish world-readable like `fs::write` would.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
+    tmp.persist(dest)?;
+    Ok(())
+}
+
 /// Compute the content hash of `wasm_bytes` and either deserialise the
-/// cached `.cwasm` for it, or compile + persist a fresh one.
+/// cached `.cwasm` for it, or compile it (full cranelift pass) — without
+/// touching disk. Callers that need to reject a bad component before ever
+/// persisting anything (`warpline-control`'s upload handler — compile,
+/// typecheck, *then* persist, see [`persist_cwasm`]) use this instead of
+/// [`load_or_compile`], which always publishes.
 ///
-/// If a cached entry exists but fails to deserialise (corrupt or stale),
-/// this logs a warning and falls through to recompiling from `wasm_bytes`,
-/// overwriting the bad entry — it never propagates the deserialize error.
-///
-/// Returns the loaded [`Component`] in both cases.
-pub fn load_or_compile(
+/// If a cached `.cwasm` entry exists but fails to deserialise (corrupt or
+/// stale), this logs a warning and falls through to recompiling from
+/// `wasm_bytes` — it never propagates the deserialize error. The returned
+/// `bool` is `true` iff that happened (a fresh compile, not a cache hit) —
+/// [`load_or_compile`] uses it to only call [`persist_cwasm`] when there's
+/// actually something new to publish.
+pub fn compile(
     engine: &Engine,
     wasm_bytes: &[u8],
     cache_dir: &Path,
-) -> anyhow::Result<Component> {
+) -> anyhow::Result<(Component, String, bool)> {
     let digest = digest(wasm_bytes);
     let cached = cache_dir.join(cache_file_name(engine, &digest));
 
     if cached.exists() {
         match load_cwasm(engine, cache_dir, &digest) {
-            Ok(component) => return Ok(component),
+            Ok(component) => return Ok((component, digest, false)),
             Err(e) => {
                 tracing::warn!(
                     path = %cached.display(),
@@ -142,26 +171,46 @@ pub fn load_or_compile(
         }
     }
 
-    std::fs::create_dir_all(cache_dir)?;
     let component = Component::new(engine, wasm_bytes)?;
+    Ok((component, digest, true))
+}
+
+/// Serialize `component` and publish it to `cache_dir/{digest}-{compat}.cwasm`
+/// (atomically — see [`atomic_write`]). Split out of [`load_or_compile`] so
+/// callers that must not persist an unchecked component (see [`compile`])
+/// can typecheck first.
+///
+/// Always (re)writes, even if a file is already there at that path: `compile`
+/// falls through to a fresh compile whenever the existing entry failed to
+/// deserialize (corrupt or stale), and that bad entry needs overwriting, not
+/// skipping — there's no cheap way to tell "already-published, valid" apart
+/// from "still there because we couldn't parse it" just from the path
+/// existing.
+pub fn persist_cwasm(
+    component: &Component,
+    engine: &Engine,
+    cache_dir: &Path,
+    digest: &str,
+) -> anyhow::Result<()> {
+    let dest = cache_dir.join(cache_file_name(engine, digest));
     let serialized = component.serialize()?;
+    atomic_write(cache_dir, &dest, &serialized)
+}
 
-    // Same-directory temp file (so the rename below is same-filesystem and
-    // atomic) + `sync_all` before publishing, so a concurrent reader never
-    // sees a truncated `.cwasm` and a crash between write and rename never
-    // leaves a corrupt file at the published path.
-    let mut tmp = tempfile::NamedTempFile::new_in(cache_dir)?;
-    tmp.write_all(&serialized)?;
-    tmp.as_file().sync_all()?;
-    // NamedTempFile is 0600; the host may run as a different user than the
-    // control plane, so publish world-readable like `fs::write` would.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+/// [`compile`] + [`persist_cwasm`] in one call, skipping the publish step
+/// on a cache hit (nothing new to write) — the cache always ends up
+/// populated for `wasm_bytes`'s digest either way. Used wherever there's no
+/// separate typecheck gate between compiling and publishing (tests, and
+/// `ComponentCache`'s cwasm-miss recompile-from-source fallback, whose
+/// source bytes were already typechecked once at upload time).
+pub fn load_or_compile(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    cache_dir: &Path,
+) -> anyhow::Result<Component> {
+    let (component, digest, freshly_compiled) = compile(engine, wasm_bytes, cache_dir)?;
+    if freshly_compiled {
+        persist_cwasm(&component, engine, cache_dir, &digest)?;
     }
-    tmp.persist(&cached)?;
-
     Ok(component)
 }

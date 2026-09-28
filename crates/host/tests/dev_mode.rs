@@ -59,6 +59,10 @@ fn host_router(
     modules_dir: &Path,
     ticker: EpochTicker,
 ) -> axum::Router {
+    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
+        DbState::InsecureDev,
+        warpline_core::meter::METER_CHANNEL_CAPACITY,
+    );
     let state = warpline_host::AppState {
         engine,
         linker,
@@ -70,6 +74,7 @@ fn host_router(
         db: DbState::InsecureDev,
         metrics_handle: warpline_host::metrics_handle(),
         ticker: Arc::new(ticker),
+        meter_tx,
     };
     warpline_host::router(state)
 }
@@ -182,4 +187,45 @@ async fn upload_then_invoke_end_to_end() {
         "{}",
         String::from_utf8_lossy(&body)
     );
+}
+
+/// Finding 1: the `.cwasm` is a derived cache keyed by an engine
+/// compatibility hash — it can go missing (deleted, an engine/config
+/// upgrade invalidates it) without the source `.wasm` going with it.
+/// Deleting it after a successful upload must not break the next invoke:
+/// `ComponentCache::get_or_load` should recompile from the persisted
+/// source and re-publish a fresh `.cwasm`.
+#[tokio::test]
+async fn invoke_recovers_after_cwasm_is_deleted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = build_engine().expect("build engine");
+
+    let control = control_router(engine.clone(), build_linker(&engine).unwrap(), dir.path());
+    let ticker = EpochTicker::spawn(engine.clone());
+    let host = host_router(
+        engine.clone(),
+        build_linker(&engine).unwrap(),
+        dir.path(),
+        ticker,
+    );
+
+    let (status, json) = upload(&control, "acme", "resilient", TEST_GUEST_WASM).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let digest = json["digest"].as_str().unwrap();
+
+    let cwasm_path = warpline_core::registry::cwasm_dir(dir.path())
+        .join(warpline_core::cache::cache_file_name(&engine, digest));
+    assert!(
+        cwasm_path.exists(),
+        "expected a cwasm to have been persisted"
+    );
+    std::fs::remove_file(&cwasm_path).expect("delete cwasm");
+    assert!(!cwasm_path.exists());
+
+    let (status, body) = invoke(&host, "acme", "resilient", b"still works").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, b"still works");
+
+    // Recompiling on the miss should have re-published the cwasm too.
+    assert!(cwasm_path.exists(), "expected the cwasm to be re-published");
 }

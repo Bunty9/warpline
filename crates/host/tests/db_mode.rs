@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -154,16 +154,20 @@ async fn auth_config_and_metering_against_real_postgres() {
     let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let control_state = warpline_control::AppState {
-        engine: engine.clone(),
-        linker: linker.clone(),
-        modules_dir: dir.path().to_path_buf(),
-        db: db.clone(),
-        admin_token: Some("test-admin-token".to_string()),
-    };
+    let mut control_state = warpline_control::AppState::new(
+        engine.clone(),
+        linker.clone(),
+        dir.path().to_path_buf(),
+        db.clone(),
+    );
+    control_state.admin_token = Some("test-admin-token".to_string());
     let control = warpline_control::router(control_state);
 
     let ticker = EpochTicker::spawn(engine.clone());
+    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
+        db.clone(),
+        warpline_core::meter::METER_CHANNEL_CAPACITY,
+    );
     let host_state = warpline_host::AppState {
         engine,
         linker,
@@ -178,6 +182,7 @@ async fn auth_config_and_metering_against_real_postgres() {
         db: db.clone(),
         metrics_handle: warpline_host::metrics_handle(),
         ticker: Arc::new(ticker),
+        meter_tx,
     };
     let host = warpline_host::router(host_state);
 
@@ -238,20 +243,99 @@ async fn auth_config_and_metering_against_real_postgres() {
     // --- meter row written with ok = false after a trap -----------------
     let (status, _) = invoke(&host, &tenant_a, "echo", Some(&key_a), b"panic").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    // Metering happens off the response path (`tokio::spawn`) — give it a
-    // moment to land.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Metering is queued onto a bounded channel to a batching writer task
+    // (finding 5), not written inline — poll rather than sleeping a fixed
+    // amount then trusting insertion order (`ORDER BY id DESC`), which a
+    // batched, concurrently-running writer doesn't guarantee lines up with
+    // wall-clock call order.
     let pool = db.pool().expect("postgres pool");
-    let row: (bool,) = sqlx::query_as(
-        "SELECT ok FROM meter WHERE tenant = $1 AND func = $2 ORDER BY id DESC LIMIT 1",
-    )
-    .bind(&tenant_a)
-    .bind("echo")
-    .fetch_one(pool)
-    .await
-    .expect("meter row for the panicking invoke");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut failed_count = 0i64;
+    while Instant::now() < deadline {
+        failed_count = sqlx::query_scalar(
+            "SELECT count(*) FROM meter WHERE tenant = $1 AND func = $2 AND ok = false",
+        )
+        .bind(&tenant_a)
+        .bind("echo")
+        .fetch_one(pool)
+        .await
+        .expect("query meter table");
+        if failed_count >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        !row.0,
-        "expected the panicking invoke's meter row to have ok = false"
+        failed_count >= 1,
+        "expected at least one meter row with ok = false for the panicking invoke within 5s"
     );
+}
+
+/// Finding 14: a tenant configured with a near-zero `cpu_budget_ms` gets a
+/// 408 on a looping guest, and the config the admin route accepted is the
+/// config actually persisted (not just the config the response echoed).
+#[tokio::test]
+async fn admin_cpu_budget_config_is_enforced_and_persisted() {
+    let url = require_test_db!();
+    let db = DbState::connect_to(&url).await.expect("connect to test db");
+
+    let engine = build_engine().expect("build engine");
+    let linker = build_linker(&engine).expect("build linker");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut control_state = warpline_control::AppState::new(
+        engine.clone(),
+        linker.clone(),
+        dir.path().to_path_buf(),
+        db.clone(),
+    );
+    control_state.admin_token = Some("test-admin-token".to_string());
+    let control = warpline_control::router(control_state);
+
+    let ticker = EpochTicker::spawn(engine.clone());
+    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
+        db.clone(),
+        warpline_core::meter::METER_CHANNEL_CAPACITY,
+    );
+    let host_state = warpline_host::AppState {
+        engine,
+        linker,
+        modules_dir: dir.path().to_path_buf(),
+        component_cache: Arc::new(ComponentCache::new()),
+        kv: Arc::new(MemKv::new()),
+        http_client: build_http_client(true).expect("build http client"),
+        allow_private_egress: true,
+        db: db.clone(),
+        metrics_handle: warpline_host::metrics_handle(),
+        ticker: Arc::new(ticker),
+        meter_tx,
+    };
+    let host = warpline_host::router(host_state);
+
+    let tenant = unique_tenant("cpubudget");
+    let key = admin_create(
+        &control,
+        &tenant,
+        "test-admin-token",
+        Some(serde_json::json!({ "cpu_budget_ms": 1 })),
+    )
+    .await;
+    upload(&control, &tenant, "echo", &key, TEST_GUEST_WASM).await;
+
+    let (status, body) = invoke(&host, &tenant, "echo", Some(&key), b"loop").await;
+    assert_eq!(
+        status,
+        StatusCode::REQUEST_TIMEOUT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let pool = db.pool().expect("postgres pool");
+    let (persisted_cpu_budget_ms,): (i32,) =
+        sqlx::query_as("SELECT cpu_budget_ms FROM tenants WHERE name = $1")
+            .bind(&tenant)
+            .fetch_one(pool)
+            .await
+            .expect("tenant row");
+    assert_eq!(persisted_cpu_budget_ms, 1);
 }

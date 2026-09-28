@@ -514,9 +514,26 @@ impl std::fmt::Display for CpuBudgetExceededMarker {
 
 impl std::error::Error for CpuBudgetExceededMarker {}
 
+/// Returns true iff `err` is (or wraps) the epoch-deadline interrupt this
+/// module's `epoch_deadline_callback` raises once a store's CPU-budget
+/// ticks are exhausted — either our own [`CpuBudgetExceededMarker`], or
+/// wasmtime's own [`wasmtime::Trap::Interrupt`] (kept as a fallback; the
+/// callback-based, yielding deadline never actually raises it, but a
+/// future wasmtime version might change that). Shared by [`classify_trap`]
+/// (a failed `call_handle`) and `invoke`'s own check on a failed
+/// `instantiate_async` — the epoch can just as well fire mid-instantiation
+/// for a very small budget, before `call_handle` ever runs.
+fn is_cpu_budget_error(err: &wasmtime::Error) -> bool {
+    err.downcast_ref::<CpuBudgetExceededMarker>().is_some()
+        || matches!(
+            err.downcast_ref::<wasmtime::Trap>(),
+            Some(t) if *t == wasmtime::Trap::Interrupt
+        )
+}
+
 /// Classify a failed `call_handle` into an [`InvokeError`], using the
-/// [`crate::types::TenantLimiter`] state left behind in `store` and the
-/// error's downcast to [`CpuBudgetExceededMarker`] / [`wasmtime::Trap`].
+/// [`crate::types::TenantLimiter`] state left behind in `store` and
+/// [`is_cpu_budget_error`].
 ///
 /// CPU-budget exhaustion is checked *before* the memory-cap flag: a store
 /// whose `memory.grow` was rejected doesn't trap on the spot (wasm just
@@ -525,12 +542,7 @@ impl std::error::Error for CpuBudgetExceededMarker {}
 /// `cap_hit` still set from the earlier rejection. Checking the interrupt
 /// first reports the trap that actually ended the call.
 fn classify_trap(err: wasmtime::Error, store: &Store<HostCtx>, budget_ms: u64) -> InvokeError {
-    let is_cpu_budget = err.downcast_ref::<CpuBudgetExceededMarker>().is_some()
-        || matches!(
-            err.downcast_ref::<wasmtime::Trap>(),
-            Some(t) if *t == wasmtime::Trap::Interrupt
-        );
-    if is_cpu_budget {
+    if is_cpu_budget_error(&err) {
         return InvokeError::CpuBudgetExceeded { budget_ms };
     }
     let limiter = &store.data().limiter;
@@ -586,6 +598,15 @@ pub async fn invoke(
 
         let bindings = match Handler::instantiate_async(&mut store, component, linker).await {
             Ok(bindings) => bindings,
+            // A very small `cpu_budget_ms` can exhaust the epoch deadline
+            // during instantiation itself, before `call_handle` ever runs —
+            // classify that the same way a mid-call interrupt is (408, not
+            // a generic 500 instantiate failure).
+            Err(e) if is_cpu_budget_error(&e) => {
+                return Err(InvokeError::CpuBudgetExceeded {
+                    budget_ms: cpu_budget_ms,
+                })
+            }
             Err(e) => return Err(InvokeError::Instantiate(e.to_string())),
         };
 

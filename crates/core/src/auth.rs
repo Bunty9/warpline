@@ -77,7 +77,10 @@ impl DbState {
     /// tests, which each want their own pool against a fixed test Postgres
     /// instance without mutating process-wide env state.
     pub async fn connect_to(url: &str) -> anyhow::Result<Self> {
-        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect(url)
+            .await?;
         MIGRATOR.run(&pool).await?;
         Ok(Self::Postgres(pool))
     }
@@ -156,9 +159,17 @@ pub async fn authenticate(
     }))
 }
 
-/// Strip a leading `"Bearer "` from an `Authorization` header value.
+/// Strip a `"Bearer "` scheme from an `Authorization` header value. The
+/// scheme name is matched case-insensitively (RFC 7235 auth-schemes are
+/// case-insensitive) and the token is trimmed of surrounding whitespace;
+/// an empty token after trimming is treated as absent.
 pub fn parse_bearer(header_value: &str) -> Option<&str> {
-    header_value.strip_prefix("Bearer ")
+    let (scheme, rest) = header_value.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
 }
 
 #[cfg(test)]
@@ -171,5 +182,14 @@ mod tests {
         assert_eq!(parse_bearer("wl_abc"), None);
         assert_eq!(parse_bearer("Basic abc"), None);
         assert_eq!(parse_bearer(""), None);
+    }
+
+    #[test]
+    fn parse_bearer_is_case_insensitive_and_trims_token() {
+        assert_eq!(parse_bearer("bearer wl_abc"), Some("wl_abc"));
+        assert_eq!(parse_bearer("BEARER wl_abc"), Some("wl_abc"));
+        assert_eq!(parse_bearer("  Bearer   wl_abc  "), Some("wl_abc"));
+        assert_eq!(parse_bearer("Bearer    "), None);
+        assert_eq!(parse_bearer("Bearer"), None);
     }
 }

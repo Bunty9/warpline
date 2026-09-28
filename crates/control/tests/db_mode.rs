@@ -45,16 +45,9 @@ async fn state(db: DbState, admin_token: Option<&str>) -> (AppState, tempfile::T
     let engine = build_engine().expect("build engine");
     let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
-    (
-        AppState {
-            engine,
-            linker,
-            modules_dir: dir.path().to_path_buf(),
-            db,
-            admin_token: admin_token.map(str::to_string),
-        },
-        dir,
-    )
+    let mut state = AppState::new(engine, linker, dir.path().to_path_buf(), db);
+    state.admin_token = admin_token.map(str::to_string);
+    (state, dir)
 }
 
 async fn post(
@@ -232,4 +225,56 @@ fn multipart_body(wasm: &[u8]) -> Vec<u8> {
     body.extend_from_slice(wasm);
     body.extend_from_slice(b"\r\n--x--\r\n");
     body
+}
+
+async fn upload_status(
+    app: &axum::Router,
+    tenant: &str,
+    func: &str,
+    key: &str,
+    wasm: &[u8],
+) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/tenants/{tenant}/functions/{func}"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(Body::from(multipart_body(wasm)))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Finding 3: a tenant is capped at 100 distinct function names. Re-upload
+/// of an existing name must still work at the cap (only *new* names count
+/// against it), and going over it is a 403, not a 500 or a silently
+/// accepted upload.
+#[tokio::test]
+async fn upload_enforces_per_tenant_function_quota() {
+    let db = require_test_db!();
+    let tenant = unique_tenant("quota");
+    let wasm: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../core/tests/fixtures/test_guest.wasm"
+    ));
+    let (state, _dir) = state(db, Some("tok")).await;
+    let app = router(state);
+
+    let (_, json) = post(&app, &format!("/admin/tenants/{tenant}"), Some("tok"), None).await;
+    let key = json["api_key"].as_str().unwrap().to_string();
+
+    for i in 0..100 {
+        let status = upload_status(&app, &tenant, &format!("f{i}"), &key, wasm).await;
+        assert_eq!(status, StatusCode::CREATED, "upload f{i} should succeed");
+    }
+
+    let status = upload_status(&app, &tenant, "f100", &key, wasm).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "101st distinct name over quota"
+    );
+
+    // Re-uploading an existing name still works even sitting right at the cap.
+    let status = upload_status(&app, &tenant, "f0", &key, wasm).await;
+    assert_eq!(status, StatusCode::CREATED, "re-upload of existing name");
 }
