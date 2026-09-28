@@ -79,7 +79,7 @@ fn parse_ttl_secs(raw: Option<String>) -> Duration {
 /// crate's manifest dir (`crates/core`) — one level under the repo root,
 /// same as `crates/host` and `crates/control` — so it resolves to
 /// `<repo>/migrations` regardless of which binary links this in.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Per-tenant resource caps + outbound-HTTP allowlist. Comes from the
 /// `tenants` table when [`DbState::Postgres`], or a fixed default under

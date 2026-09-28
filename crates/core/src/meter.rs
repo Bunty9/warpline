@@ -4,10 +4,10 @@
 //! error/trap alike — is queued as one [`MeterMsg`] and eventually lands as
 //! one row in the `meter` table recording `(tenant, func, cpu_us,
 //! mem_peak_bytes, ok)` plus a default `now()` timestamp. `ok` (added in
-//! `migrations/0002_auth_config.sql`) is `false` for a
+//! `crates/core/migrations/0002_auth_config.sql`) is `false` for a
 //! trapped/timed-out/capped invocation, so the billing rollup job (out of
 //! scope for Phase 1/2) can tell a metered failure from a metered success.
-//! The schema is otherwise owned in `migrations/0001_init.sql`.
+//! The schema is otherwise owned in `crates/core/migrations/0001_init.sql`.
 //!
 //! This is an append-only ledger for the runtime. Rows are queued rather
 //! than written inline on the invoke path: a per-invoke `tokio::spawn` +

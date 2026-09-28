@@ -332,7 +332,7 @@ Every environment variable either binary reads, with its default:
 
 ## Writing a guest
 
-A guest is a `wasm32-wasip2` component built against `wit/warpline.wit`'s
+A guest is a `wasm32-wasip2` component built against `crates/core/wit/warpline.wit`'s
 `handler` world:
 
 ```wit
@@ -348,7 +348,7 @@ Only `handle` is required — a guest need not call any of the imports.
 Using `wit-bindgen` (Rust):
 
 ```rust
-wit_bindgen::generate!({ world: "handler", path: "../../wit" });
+wit_bindgen::generate!({ world: "handler", path: "../../crates/core/wit" });
 
 struct MyGuest;
 impl Guest for MyGuest {
@@ -414,17 +414,17 @@ when `examples/test-guest` changes; commit the result.
 ```
 warpline/
   Cargo.toml                          # workspace root (excludes examples/*)
-  wit/warpline.wit                    # capability surface (Component Model)
   crates/
     core/                             # Engine + host imports + cache + registry + meter + auth
       src/{lib,runtime,types,kv,cache,registry,meter,auth}.rs
+      wit/warpline.wit                # capability surface (Component Model)
+      migrations/0001_init.sql        # tenants, functions, meter tables
+      migrations/0002_auth_config.sql # api_keys, tenant resource caps, meter.ok
     host/                             # axum invoke API, :8080 (+ /metrics on :9090)
     control/                          # axum upload + admin API, :8081
   examples/
     hello-wasm/                       # minimal guest crate + its own README
     test-guest/                       # bench/test fixture source, not a public example
-  migrations/0001_init.sql            # tenants, functions, meter tables
-  migrations/0002_auth_config.sql     # api_keys, tenant resource caps, meter.ok
   scripts/build-guests.sh             # builds the guest examples, refreshes the test fixture
   Dockerfile                          # cargo-chef multi-stage, distroless cc
   docker-compose.yml                  # postgres + warpline-host + warpline-control

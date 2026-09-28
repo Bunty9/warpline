@@ -16,7 +16,7 @@
 
 wit_bindgen::generate!({
     world: "handler",
-    path: "../../wit",
+    path: "../../crates/core/wit",
 });
 
 struct HelloGuest;

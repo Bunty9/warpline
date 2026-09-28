@@ -3,7 +3,7 @@
 //!
 //! Modules:
 //! - [`runtime`] — `Engine`/`Linker` builders, `wasmtime::component::bindgen!`
-//!   host bindings for `wit/warpline.wit`, the epoch ticker, and
+//!   host bindings for `crates/core/wit/warpline.wit`, the epoch ticker, and
 //!   [`runtime::invoke`].
 //! - [`kv`] — [`kv::KvStore`] trait + in-memory implementation, scoped per
 //!   tenant by [`types::HostCtx`].

@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Control plane — accepts .wasm uploads, compiles to .cwasm by content hash."
+description = "warpline control plane: authenticated WebAssembly component uploads, compile-time import checks, content-addressed module registry and tenant/API-key administration."
+categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "warpline-control"

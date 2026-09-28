@@ -15,7 +15,7 @@ COPY --from=planner /app/recipe.json recipe.json
 # Cook the dependency layer first — this is the cargo-chef speedup.
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-# wit/ dir is needed for bindgen! at compile time
+# crates/core/{wit,migrations} are read at compile time (bindgen!, sqlx::migrate!)
 RUN cargo build --release --bin warpline-host --bin warpline-control
 # Pre-create the modules dir owned by distroless `nonroot` (65532): a fresh
 # named volume copies this ownership, otherwise it is root-owned and the

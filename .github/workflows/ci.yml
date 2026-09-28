@@ -82,6 +82,18 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+  package:
+    name: cargo package (publish readiness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds each crate from its packaged tarball, catching files read
+      # outside the crate dir (wit/, migrations/) or missing metadata.
+      - name: cargo package --workspace
+        run: cargo package --workspace
+
   bench:
     name: criterion (non-blocking)
     runs-on: ubuntu-latest

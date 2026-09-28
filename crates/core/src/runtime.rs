@@ -1,6 +1,6 @@
 //! WASM runtime — Component-Model engine construction, host-import
 //! registration (`wasmtime::component::bindgen!` against
-//! `wit/warpline.wit`), the epoch-based CPU ticker, and the `invoke` entry
+//! `crates/core/wit/warpline.wit`), the epoch-based CPU ticker, and the `invoke` entry
 //! point used by `warpline-host`.
 //!
 //! ## wasmtime 49 shape
@@ -45,7 +45,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use crate::types::HostCtx;
 
 wasmtime::component::bindgen!({
-    path: "../../wit",
+    path: "wit",
     world: "handler",
     imports: { default: async | trappable },
     exports: { default: async },

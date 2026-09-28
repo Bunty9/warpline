@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Core types — Engine builder, host imports, tenant KV, module cache, metering for warpline."
+description = "Sandboxed multi-tenant WebAssembly runtime core for warpline: wasmtime Component Model host bindings, epoch CPU and memory caps, tenant-scoped KV, allowlisted outbound HTTP, content-addressed module cache and metering."
+documentation = "https://docs.rs/warpline-core"
+categories = ["wasm", "web-programming"]
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "../../README.md"
 
 [lib]
 path = "src/lib.rs"

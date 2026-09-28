@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Multi-tenant axum server that invokes precompiled WASM functions."
+description = "warpline invoke server: runs tenants' WebAssembly components over HTTP with per-tenant CPU, memory and egress limits, API-key auth and metering."
+categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "warpline-host"

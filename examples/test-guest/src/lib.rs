@@ -22,7 +22,7 @@
 
 wit_bindgen::generate!({
     world: "handler",
-    path: "../../wit",
+    path: "../../crates/core/wit",
 });
 
 use warpline::host::http_out::{fetch, Request};

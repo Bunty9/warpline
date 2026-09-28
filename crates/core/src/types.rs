@@ -8,7 +8,7 @@
 //!
 //! The hand-written `HttpReq`/`HttpResp` envelopes from Phase 1 are gone —
 //! `wasmtime::component::bindgen!` in `runtime.rs` generates `Request` /
-//! `Response` types straight from `wit/warpline.wit`, so this module no
+//! `Response` types straight from `crates/core/wit/warpline.wit`, so this module no
 //! longer needs to mirror them by hand.
 
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub fn valid_name(s: &str) -> bool {
 
 /// Valid range for a tenant's `cpu_budget_ms`, milliseconds — mirrored by
 /// the `CHECK` constraint on `tenants.cpu_budget_ms` in
-/// `migrations/0002_auth_config.sql`.
+/// `crates/core/migrations/0002_auth_config.sql`.
 pub const MIN_CPU_BUDGET_MS: i64 = 1;
 pub const MAX_CPU_BUDGET_MS: i64 = 10_000;
 /// Valid range for a tenant's `mem_cap_bytes` — mirrored by the `CHECK`
