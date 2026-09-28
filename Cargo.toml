@@ -72,6 +72,9 @@ lru = "0.18"
 # 32-byte API key generation (`warpline-control`'s admin route).
 getrandom = "0.3"
 
+# Bench harness (Task 3, `crates/core/benches/*`).
+criterion = "0.5"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

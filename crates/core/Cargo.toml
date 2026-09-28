@@ -27,3 +27,14 @@ tracing = { workspace = true }
 tempfile = "3"
 uuid = { workspace = true }
 lru = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "runtime"
+harness = false
+
+[[bench]]
+name = "report"
+harness = false

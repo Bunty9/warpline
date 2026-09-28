@@ -120,6 +120,23 @@ glue lands): `hello from wasm`.
 Real numbers land at the end of Phase 2 — these are the targets driving
 the design.
 
+### Results (2026-09-28)
+
+Measured via `cargo bench -p warpline-core` (`crates/core/benches/{runtime,report}.rs`)
+on an 8-core Intel i5-9300H laptop against the `test_guest.wasm` fixture
+(trivial echo/loop/alloc handler, not representative of real tenant code).
+Full numbers, methodology, and caveats (including a CPU-cap-accuracy miss
+at the 100 ms budget) are in [`PROGRESS.md`](./PROGRESS.md#bench-numbers-targets-per-projects-l3-l4md--p6-updated-weekly).
+
+| Metric                                   | Target        | Result                              |
+| ----------------------------------------- | ------------- | ------------------------------------ |
+| Cold-start from `.cwasm`                  | < 1 ms        | 0.26 ms mean — **pass**              |
+| Warm invocation p99 (10 ms budget)        | < 5 ms        | 0.152 ms — **pass**                  |
+| Instances/sec/core                        | > 1,000       | 13,564 inv/s — **pass**              |
+| CPU cap accuracy                          | budget ± 5 ms | +0.45 ms @10ms, +3.18 ms @50ms — pass; +12.11 ms @100ms — **miss** |
+| Memory cap accuracy                       | hard ceiling  | 16 MiB cap holds, peak 15.79 MiB — **pass** |
+| Cost per million vs CF Workers            | within 2×     | back-of-envelope estimate only, see PROGRESS.md — not a real quote |
+
 ## Design tradeoffs
 
 The defenses behind every load-bearing runtime choice. These are the
