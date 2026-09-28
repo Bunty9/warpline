@@ -6,7 +6,7 @@
 > portfolio project for the Rust Level-4 roadmap — the Cloudflare Workers /
 > Fastly Compute / Fermyon Spin pattern, scoped to one box and ten clients.
 
-[![ci](https://img.shields.io/badge/ci-pending-lightgrey.svg)](./.github/workflows/ci.yml)
+[![ci](https://github.com/Bunty9/warpline/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/warpline/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
