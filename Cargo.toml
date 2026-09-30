@@ -80,7 +80,7 @@ lru = "0.18"
 getrandom = "0.3"
 
 # Bench harness (Task 3, `crates/core/benches/*`).
-criterion = "0.5"
+criterion = "0.8"
 
 [profile.release]
 lto = "fat"
