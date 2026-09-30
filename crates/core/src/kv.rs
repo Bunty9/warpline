@@ -134,6 +134,14 @@ impl KvStore for MemKv {
     }
 }
 
+impl std::fmt::Debug for MemKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemKv")
+            .field("tenant_cap_bytes", &self.tenant_cap_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

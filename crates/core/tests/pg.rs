@@ -51,6 +51,17 @@ macro_rules! pool_or_skip {
     };
 }
 
+async fn public_columns(pool: &PgPool, table: &str) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn migrate_is_idempotent_and_leaves_public_schema_alone() {
     let pool = pool_or_skip!();
@@ -64,19 +75,21 @@ async fn migrate_is_idempotent_and_leaves_public_schema_alone() {
         .await
         .unwrap();
 
+    // Snapshot first: the DB may already hold other tables of these names.
+    let mut before = std::collections::HashMap::new();
+    for table in ["tenants", "_sqlx_migrations"] {
+        before.insert(table, public_columns(&pool, table).await);
+    }
+
     pg::migrate(&pool).await.unwrap();
     pg::migrate(&pool).await.unwrap();
 
     for table in ["tenants", "_sqlx_migrations"] {
-        let cols: Vec<String> = sqlx::query_scalar(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = $1",
-        )
-        .bind(table)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(cols, ["marker"], "public.{table} was modified");
+        assert_eq!(
+            public_columns(&pool, table).await,
+            before[table],
+            "public.{table} was modified"
+        );
     }
     let in_warpline: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables \
@@ -125,11 +138,16 @@ async fn auth_cache_ttl_is_respected() {
     let key = pg::create_tenant(&pool, &name, None).await.unwrap().api_key;
     let new = Limits::new(9, 3 << 20).unwrap();
 
-    let cached = Authenticator::new(pool.clone(), Duration::from_millis(400));
+    let cached = Authenticator::new(pool.clone(), Duration::from_secs(5));
+    let short = Authenticator::new(pool.clone(), Duration::from_millis(300));
     let uncached = Authenticator::new(pool.clone(), Duration::ZERO);
     let default = AuthOutcome::Authorized(Limits::default());
     assert_eq!(
         cached.authenticate(&name, Some(&key)).await.unwrap(),
+        default
+    );
+    assert_eq!(
+        short.authenticate(&name, Some(&key)).await.unwrap(),
         default
     );
 
@@ -143,9 +161,10 @@ async fn auth_cache_ttl_is_respected() {
         uncached.authenticate(&name, Some(&key)).await.unwrap(),
         AuthOutcome::Authorized(new.clone())
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Sleeping past the short TTL guarantees expiry; `cached` (5 s) stays stale.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
-        cached.authenticate(&name, Some(&key)).await.unwrap(),
+        short.authenticate(&name, Some(&key)).await.unwrap(),
         AuthOutcome::Authorized(new)
     );
 }

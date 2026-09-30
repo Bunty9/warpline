@@ -19,6 +19,8 @@
 //! - [`types`] — [`types::HostCtx`] and [`types::TenantLimiter`], the
 //!   per-invocation state attached to every `Store`.
 
+#![warn(missing_debug_implementations)]
+
 pub mod cache;
 pub mod kv;
 pub mod meter;

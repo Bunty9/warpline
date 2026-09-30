@@ -57,6 +57,14 @@ struct Inner {
 #[derive(Clone)]
 pub struct Authenticator(Arc<Inner>);
 
+impl std::fmt::Debug for Authenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authenticator")
+            .field("ttl", &self.0.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Authenticator {
     pub fn new(pool: PgPool, ttl: Duration) -> Self {
         Self(Arc::new(Inner {

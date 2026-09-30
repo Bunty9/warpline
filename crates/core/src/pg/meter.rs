@@ -42,6 +42,20 @@ pub struct PgMeterHandle {
     stop: Arc<Notify>,
 }
 
+impl std::fmt::Debug for PgMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgMeter")
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PgMeterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgMeterHandle").finish_non_exhaustive()
+    }
+}
+
 impl PgMeter {
     /// Start the writer task. `capacity` bounds queued rows. Needs a tokio
     /// runtime.
@@ -68,7 +82,14 @@ impl MeterSink for PgMeter {
             ok,
         };
         if self.tx.try_send(row).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            // Warn on the 1st, 2nd, 4th, 8th... drop so a stall can't flood logs.
+            let before = self.dropped.fetch_add(1, Ordering::Relaxed);
+            if before == 0 || before.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = before + 1,
+                    "meter queue full or closed; dropping rows"
+                );
+            }
         }
     }
 }

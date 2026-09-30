@@ -334,3 +334,35 @@ async fn upload_quota_race_allows_exactly_one_of_two_new_names() {
         "exactly one concurrent new-name upload should pass the quota, got {s1:?} and {s2:?}"
     );
 }
+
+/// A tenant deleted while its key is still cached must get 401, not 500.
+#[tokio::test]
+async fn upload_for_deleted_tenant_with_cached_key_is_unauthorized() {
+    let db = require_test_db!();
+    let tenant = unique_tenant("gone");
+    let wasm: &'static [u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../core/tests/fixtures/test_guest.wasm"
+    ));
+    let pool = db.pool().clone();
+    let cached = Authenticator::new(pool.clone(), Duration::from_secs(60));
+    let (state, _dir) = state(cached, Some("tok")).await;
+    let app = router(state);
+
+    let (_, json) = post(&app, &format!("/admin/tenants/{tenant}"), Some("tok"), None).await;
+    let key = json["api_key"].as_str().unwrap().to_string();
+    assert_eq!(
+        upload_status(&app, &tenant, "f", &key, wasm).await,
+        StatusCode::CREATED
+    );
+
+    sqlx::query("DELETE FROM warpline.tenants WHERE name = $1")
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        upload_status(&app, &tenant, "f", &key, wasm).await,
+        StatusCode::UNAUTHORIZED
+    );
+}

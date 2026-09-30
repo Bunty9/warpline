@@ -47,7 +47,17 @@ async fn main() -> anyhow::Result<()> {
     let (meter, meter_handle): (Arc<dyn MeterSink>, _) = match &auth {
         Some(a) => {
             let (m, h) = PgMeter::spawn(a.pool().clone(), METER_CHANNEL_CAPACITY);
-            (Arc::new(m), Some(h))
+            let m = Arc::new(m);
+            // Export the meter's drop count as a Prometheus counter.
+            let exported = m.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    metrics::counter!("warpline_meter_dropped_total").absolute(exported.dropped());
+                }
+            });
+            (m, Some(h))
         }
         None => (Arc::new(LogMeter), None),
     };

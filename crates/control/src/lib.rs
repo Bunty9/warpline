@@ -343,12 +343,14 @@ async fn publish_pointer(
         .await
         .map_err(|e| internal_error(e, "failed to take publish lock"))?;
 
+    // The tenant may have been deleted while its key sat in the auth cache.
     let tenant_id: sqlx::types::Uuid =
         sqlx::query_scalar("SELECT id FROM warpline.tenants WHERE name = $1")
             .bind(tenant)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| internal_error(e, "failed to look up tenant"))?;
+            .map_err(|e| internal_error(e, "failed to look up tenant"))?
+            .ok_or((StatusCode::UNAUTHORIZED, "unauthorized".to_string()))?;
 
     let max_functions = state.max_functions_per_tenant;
     let other_functions: i64 = sqlx::query_scalar(

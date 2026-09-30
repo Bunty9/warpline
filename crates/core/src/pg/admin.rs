@@ -27,11 +27,20 @@ pub enum AdminError {
 
 /// A freshly issued API key. The raw key exists only here: only its SHA-256
 /// hash is stored, so it cannot be shown again.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct IssuedKey {
     pub tenant: String,
     pub api_key: String,
+}
+
+impl std::fmt::Debug for IssuedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedKey")
+            .field("tenant", &self.tenant)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Convert validated limits to their column types.

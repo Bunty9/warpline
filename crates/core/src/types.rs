@@ -266,6 +266,7 @@ const MAX_MEMORIES: usize = 4;
 /// this limiter did) lets a component with N memories use N times the
 /// intended cap. Tracking a running `total_bytes` across every memory this
 /// limiter has seen closes that.
+#[derive(Debug)]
 pub struct TenantLimiter {
     pub mem_cap_bytes: usize,
     /// Sum of `desired - current` over every accepted `memory_growing` call
@@ -346,6 +347,15 @@ impl wasmtime::ResourceLimiter for TenantLimiter {
 
     fn memories(&self) -> usize {
         MAX_MEMORIES
+    }
+}
+
+impl std::fmt::Debug for HostCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostCtx")
+            .field("tenant_id", &self.tenant_id)
+            .field("fn_name", &self.fn_name)
+            .finish_non_exhaustive()
     }
 }
 

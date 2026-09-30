@@ -423,6 +423,14 @@ pub fn gc_unreferenced_blobs(
     Ok(removed)
 }
 
+impl std::fmt::Debug for ComponentCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComponentCache")
+            .field("byte_budget", &self.byte_budget)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
