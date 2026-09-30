@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use lru::LruCache;
+use tokio::sync::Semaphore;
 use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
@@ -179,6 +180,10 @@ pub(crate) struct ComponentCache {
     engine: Engine,
     linker: Arc<Linker<HostCtx>>,
     modules_dir: PathBuf,
+    /// Bounds concurrent recompiles from source (shared with `Runtime::stage`)
+    /// so a burst of misses after an engine upgrade can't start unbounded
+    /// cranelift passes.
+    compile_slots: Arc<Semaphore>,
     inner: Mutex<ComponentCacheInner>,
     byte_budget: usize,
 }
@@ -188,6 +193,7 @@ impl ComponentCache {
         engine: Engine,
         linker: Arc<Linker<HostCtx>>,
         modules_dir: PathBuf,
+        compile_slots: Arc<Semaphore>,
         cap: usize,
         byte_budget: usize,
     ) -> Self {
@@ -195,6 +201,7 @@ impl ComponentCache {
             engine,
             linker,
             modules_dir,
+            compile_slots,
             inner: Mutex::new(ComponentCacheInner {
                 lru: LruCache::new(NonZeroUsize::new(cap.max(1)).unwrap()),
                 total_bytes: 0,
@@ -264,6 +271,13 @@ impl ComponentCache {
                             "no cwasm and no source wasm on disk for digest {digest}"
                         ))
                     })?;
+                // Blocking thread (spawn_blocking), so waiting on the async
+                // semaphore via the runtime handle is fine. Outside a tokio
+                // runtime (plain unit tests) there is nothing to bound.
+                let _permit = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => handle.block_on(self.compile_slots.acquire()).ok(),
+                    Err(_) => None,
+                };
                 let component = Component::new(&self.engine, &wasm_bytes)?;
                 let weight =
                     match cache::persist_cwasm(&component, &self.engine, &cwasm_dir, digest) {
@@ -476,7 +490,14 @@ mod tests {
 
     fn test_cache(engine: &Engine, dir: &Path) -> ComponentCache {
         let linker = Arc::new(build_linker(engine).unwrap());
-        ComponentCache::new(engine.clone(), linker, dir.to_path_buf(), 256, usize::MAX)
+        ComponentCache::new(
+            engine.clone(),
+            linker,
+            dir.to_path_buf(),
+            Arc::new(Semaphore::new(1)),
+            256,
+            usize::MAX,
+        )
     }
 
     #[test]
@@ -637,7 +658,14 @@ mod tests {
     fn component_cache_evicts_by_byte_budget() {
         let engine = build_engine().unwrap();
         let linker = Arc::new(build_linker(&engine).unwrap());
-        let cache = ComponentCache::new(engine.clone(), linker.clone(), PathBuf::new(), 256, 1);
+        let cache = ComponentCache::new(
+            engine.clone(),
+            linker.clone(),
+            PathBuf::new(),
+            Arc::new(Semaphore::new(1)),
+            256,
+            1,
+        );
         let component = wasmtime::component::Component::new(&engine, TEST_GUEST_WASM).unwrap();
         let pre = Arc::new(crate::sandbox::instantiate_pre(&linker, &component).unwrap());
         cache.insert("d1", pre, 100);

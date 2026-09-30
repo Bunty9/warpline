@@ -40,6 +40,10 @@ pub enum PublishError {
     ImportMismatch(#[source] wasmtime::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The registry state was inconsistent or a background task failed; the
+    /// underlying [`Error`] says which.
+    #[error("registry error")]
+    Registry(#[source] Error),
 }
 
 /// Why [`Runtime::invoke`](crate::Runtime::invoke) failed. Non-exhaustive.

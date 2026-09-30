@@ -33,6 +33,14 @@ const MIB: usize = 1024 * 1024;
 #[non_exhaustive]
 pub struct RuntimeConfig {
     /// Root of the module registry. Created if missing.
+    ///
+    /// # Trust
+    ///
+    /// Everything under `modules_dir/cwasm` is deserialized as native
+    /// machine code and executed. Anyone who can write there can run
+    /// arbitrary code as the host process, so the directory (and its
+    /// parents) must be writable only by the host process and trusted
+    /// operators, never by tenants or shared with less-trusted services.
     pub modules_dir: PathBuf,
     /// Let guests' `http-out` reach loopback/private/link-local addresses.
     /// One flag drives both the DNS resolver filter and the IP-literal check.
@@ -118,17 +126,19 @@ impl RuntimeBuilder {
         let linker = Arc::new(sandbox::build_linker(&engine)?);
         let http_client = sandbox::build_http_client(cfg.allow_private_egress)
             .map_err(|e| Error::Internal(format!("failed to build http client: {e}")))?;
+        let compile_slots = Arc::new(Semaphore::new(cfg.compile_concurrency));
         let components = ComponentCache::new(
             engine.clone(),
             linker.clone(),
             cfg.modules_dir.clone(),
+            compile_slots.clone(),
             cfg.component_cache_entries,
             cfg.component_cache_bytes,
         );
         let ticker = EpochTicker::spawn(engine.clone());
         Ok(Runtime(Arc::new(Inner {
             admission: Arc::new(Semaphore::new(cfg.memory_budget_bytes / MIB)),
-            compile_slots: Arc::new(Semaphore::new(cfg.compile_concurrency)),
+            compile_slots,
             in_flight: Mutex::new(HashMap::new()),
             kv: self.kv.unwrap_or_else(|| Arc::new(MemKv::new())),
             meter: self.meter,
@@ -173,24 +183,35 @@ struct Inner {
 /// Publish a component under `(tenant, function)`, then invoke it with
 /// per-call [`Limits`]. Cheap to clone; clones share all state.
 ///
-/// ```no_run
+/// ```
 /// use std::sync::Arc;
 /// use warpline_core::{Bytes, Limits, MemKv, Runtime, RuntimeConfig};
 ///
-/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-/// let runtime = Runtime::builder(RuntimeConfig::new("./modules"))
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// let runtime = Runtime::builder(RuntimeConfig::new(dir.path()))
 ///     .kv(Arc::new(MemKv::new()))
 ///     .build()?;
 ///
-/// let wasm = std::fs::read("handler.wasm")?;
-/// runtime.publish("acme", "hello", Bytes::from(wasm)).await?;
+/// // A component implementing the `handler` world (see `wit/warpline.wit`);
+/// // this one, from the test suite, echoes its input.
+/// let wasm = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_guest.wasm"));
+/// runtime.publish("acme", "hello", Bytes::from_static(wasm)).await?;
 ///
 /// let limits = Limits::new(50, 32 << 20)?;
 /// let out = runtime.invoke("acme", "hello", b"hi".to_vec(), &limits).await?;
+/// assert_eq!(out.output, b"hi");
 /// println!("{} bytes back, {} us cpu", out.output.len(), out.usage.cpu_us);
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Trust
+///
+/// The registry directory ([`RuntimeConfig::modules_dir`]) holds native code
+/// (`cwasm/`) that is loaded without further checks. Keep it writable only
+/// by the host process and trusted operators.
 ///
 /// # Capacity
 ///
@@ -256,7 +277,9 @@ impl Runtime {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| std::io::Error::other("compile semaphore closed"))?;
+            .map_err(|_| {
+                PublishError::Registry(Error::Internal("compile semaphore closed".into()))
+            })?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let modules_dir = &inner.cfg.modules_dir;
@@ -264,8 +287,7 @@ impl Runtime {
             let (component, digest, fresh) = cache::compile(&inner.engine, &wasm, &cwasm_dir)
                 .map_err(|e| match e {
                     Error::Wasmtime(e) => PublishError::Compile(e),
-                    Error::Io(e) => PublishError::Io(e),
-                    other => PublishError::Io(std::io::Error::other(other.to_string())),
+                    other => into_publish_err(other),
                 })?;
             sandbox::typecheck_component(&inner.linker, &component)
                 .map_err(PublishError::ImportMismatch)?;
@@ -282,7 +304,7 @@ impl Runtime {
             Ok(Staged { digest })
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("stage task failed: {e}")))?
+        .map_err(|e| PublishError::Registry(Error::Internal(format!("stage task failed: {e}"))))?
     }
 
     /// Atomically point `(tenant, func)` at `staged`. Invocations that start
@@ -302,7 +324,7 @@ impl Runtime {
             registry::write_pointer(&inner.cfg.modules_dir, &tenant, &func, &digest)
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("activate task failed: {e}")))?
+        .map_err(|e| PublishError::Registry(Error::Internal(format!("activate task failed: {e}"))))?
         .map_err(into_publish_err)
     }
 
@@ -331,6 +353,11 @@ impl Runtime {
     /// including when the returned future is dropped mid-call (then as a
     /// failure). The tenant's in-flight slot and the memory admission are
     /// released on every exit path.
+    ///
+    /// Admission is taken *before* the module is loaded and held through it,
+    /// so a burst of cold invocations (first use, or after an engine upgrade
+    /// forces recompiles) occupies budget while loading and can see
+    /// [`Overloaded`](InvokeError::Overloaded).
     pub async fn invoke(
         &self,
         tenant: &str,
@@ -441,7 +468,7 @@ impl std::fmt::Debug for Runtime {
 fn into_publish_err(e: Error) -> PublishError {
     match e {
         Error::Io(e) => PublishError::Io(e),
-        other => PublishError::Io(std::io::Error::other(other.to_string())),
+        other => PublishError::Registry(other),
     }
 }
 
@@ -519,5 +546,44 @@ impl Drop for MeterGuard<'_> {
             );
             sink.record(self.tenant, self.func, usage, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/test_guest.wasm"
+    ));
+
+    /// The epoch thread lives exactly as long as the shared state: it keeps
+    /// running while any clone (or in-flight invoke) exists and is stopped
+    /// and joined once the last one is dropped.
+    #[tokio::test]
+    async fn ticker_stops_after_last_clone_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime::new(RuntimeConfig::new(dir.path())).unwrap();
+        let stopped = rt.0._ticker.stop_flag();
+        let weak = Arc::downgrade(&rt.0);
+
+        let clone = rt.clone();
+        drop(rt);
+        assert!(!stopped.load(Ordering::Relaxed), "a clone is still alive");
+        assert!(weak.upgrade().is_some());
+
+        // Also after real use: invoke, then drop the last handle.
+        clone
+            .publish("t", "f", Bytes::from_static(TEST_GUEST_WASM))
+            .await
+            .unwrap();
+        clone
+            .invoke("t", "f", b"x".to_vec(), &Limits::default())
+            .await
+            .unwrap();
+        drop(clone);
+        assert!(stopped.load(Ordering::Relaxed), "ticker must stop");
+        assert!(weak.upgrade().is_none(), "no leaked Arc<Inner>");
     }
 }

@@ -279,6 +279,14 @@ impl EpochTicker {
     }
 }
 
+#[cfg(test)]
+impl EpochTicker {
+    /// The stop flag, set (before the thread is joined) when dropped.
+    pub(crate) fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+}
+
 impl Drop for EpochTicker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -507,6 +515,13 @@ async fn http_fetch(
 /// budget.
 const INSTANTIATE_GRACE_TICKS: u64 = 2;
 
+/// Instantiation is limited to `budget + 1 + grace` ticks. Afterwards the
+/// call's limit forgives at most the grace that instantiation used, so the
+/// whole invocation never exceeds `budget + 1 + grace` ticks.
+fn call_limit(ticks_used_by_instantiation: u64, budget_ticks: u64) -> u64 {
+    ticks_used_by_instantiation.min(INSTANTIATE_GRACE_TICKS) + budget_ticks + 1
+}
+
 /// Marker error returned by the epoch deadline callback once a store's tick
 /// budget is exhausted. [`classify`] downcasts to this to recognise "the CPU
 /// budget ran out" independent of wasmtime's own `Trap::Interrupt`.
@@ -602,9 +617,8 @@ pub(crate) async fn run(
 
         let outcome = async {
             let bindings = pre.instantiate_async(&mut store).await?;
-            // The call's budget starts here, whatever instantiation used.
             limit.store(
-                ticks.load(Ordering::Relaxed) + budget_ticks + 1,
+                call_limit(ticks.load(Ordering::Relaxed), budget_ticks),
                 Ordering::Relaxed,
             );
             bindings.call_handle(&mut store, input).await
@@ -700,6 +714,19 @@ mod tests {
                 *expected,
                 "is_blocked_ip({ip}) expected {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn call_limit_forgives_at_most_the_grace() {
+        use super::{call_limit, INSTANTIATE_GRACE_TICKS as G};
+        // The limit is an absolute tick count for the whole invocation.
+        for budget in [1u64, 10, 100] {
+            for used in 0..=(budget + 1 + G) {
+                let total = call_limit(used, budget);
+                assert!(total <= budget + 1 + G, "budget {budget} used {used}");
+                assert!(total > budget, "budget {budget} used {used}");
+            }
         }
     }
 }

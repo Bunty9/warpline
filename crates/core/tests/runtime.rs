@@ -503,11 +503,12 @@ async fn oversized_output_is_rejected() {
     assert!(err.usage().is_some());
 }
 
-/// The ticker belongs to the runtime's shared state, not to any one handle:
-/// dropping the caller's handle while an invoke is in flight must not stop
-/// the epoch, or the loop would never trap.
+/// A handle dropped while an invoke is running on another clone must not
+/// stop the epoch, or the loop would never trap. (The sole handle cannot be
+/// dropped mid-invoke: the future borrows it. The ticker's actual lifetime,
+/// stopping after the last clone, is unit-tested in `runtime.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ticker_outlives_dropped_handle_while_invoke_is_in_flight() {
+async fn dropping_a_handle_mid_invoke_does_not_stop_the_epoch() {
     let (rt, _dir) = setup().await;
     let task = {
         let rt = rt.clone();
@@ -526,6 +527,42 @@ async fn ticker_outlives_dropped_handle_while_invoke_is_in_flight() {
         matches!(res, Err(InvokeError::CpuBudgetExceeded { .. })),
         "got {res:?}"
     );
+}
+
+/// A component whose static initializer spins forever never finishes
+/// instantiating. It must still be cut off, within budget + 1 tick + the
+/// instantiation grace (2 ticks), and the reported cpu_us must reflect that
+/// (no doubling of the budget between instantiation and call).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spinning_start_function_is_cut_off_within_budget_plus_grace() {
+    const SPIN: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/spin_start_guest.wasm"
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let rt = Runtime::new(config(dir.path())).unwrap();
+    rt.publish("tenant-a", FN, Bytes::from_static(SPIN))
+        .await
+        .unwrap();
+
+    let budget_ms = 50;
+    let started = Instant::now();
+    let err = rt
+        .invoke("tenant-a", FN, b"x".to_vec(), &limits(budget_ms))
+        .await
+        .expect_err("spinning initializer must be interrupted");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, InvokeError::CpuBudgetExceeded { .. }),
+        "got {err:?}"
+    );
+    let cpu_ms = err.usage().unwrap().cpu_us / 1000;
+    // budget + 1 + grace(2) ticks at most, and at least the budget.
+    assert!(
+        cpu_ms >= budget_ms && cpu_ms <= budget_ms + 3,
+        "cpu_ms {cpu_ms}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
 }
 
 /// `cpu_us` counts ticks the guest actually ran, so a neighbour hogging the
