@@ -1,6 +1,6 @@
 ---
 title: Publishing warpline to crates.io
-status: done — v0.1.0 published 2026-09-28
+status: done — v0.1.0 published 2026-09-28 (manually); releases since 0.2.0 go through trusted publishing
 date: 2026-09-28
 ---
 
@@ -38,39 +38,44 @@ All four names (`warpline`, `warpline-core`, `warpline-host`,
 - CI job `package` runs `cargo package --workspace`, which builds each
   crate from its extracted tarball — the same check `cargo publish` runs.
 
-## Release checklist
+## Release process (trusted publishing, since 0.2.0)
 
-1. `main` green in CI (including the `package` job).
-2. Decide the version. 0.x signals an unstable API; `warpline-core`'s
-   public surface (`invoke`, `HostCtx`, `registry`, `auth`) will still move.
-   Bump `[workspace.package] version` **and** the three path-dep
-   `version = "..."` entries together.
-3. Update `PROGRESS.md` / README if the release changes behaviour.
-4. Dry run, in dependency order:
-   ```bash
-   cargo package --workspace          # builds all three from tarballs
-   cargo publish -p warpline-core --dry-run
-   ```
-   (`--dry-run` for `control`/`host` fails until `warpline-core` exists on
-   the registry; `cargo package --workspace` covers them.)
-5. Log in once: `cargo login` with a crates.io token scoped to
-   `publish-new` + `publish-update` for `warpline*`.
-6. Publish in order — each must be indexed before the next resolves it:
-   ```bash
-   cargo publish -p warpline-core
-   cargo publish -p warpline-control
-   cargo publish -p warpline-host
-   ```
-   (Recent cargo also accepts `cargo publish --workspace`, which orders and
-   waits automatically.)
-7. Tag and release: `git tag -a v0.1.0 -m "warpline 0.1.0" && git push origin v0.1.0`,
-   then a GitHub release with the PROGRESS.md highlights.
-8. After publishing: add crates.io / docs.rs badges and an "Install"
-   section (`cargo install warpline-host warpline-control`) to the README;
-   confirm the docs.rs build succeeded.
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. No long-lived
+token exists: each crate has a crates.io trusted publisher configured for
+repository `Bunty9/warpline`, workflow `release.yml`, environment `release`
+(a GitHub environment that only allows `v*` tags).
 
-Publishing is permanent — a version can be yanked but never deleted or
-re-uploaded. Double-check the version and metadata before step 6.
+1. `main` green in CI (including `package` and `example`).
+2. Bump `[workspace.package] version` **and** the path-dep
+   `version = "..."` entries in `crates/*/Cargo.toml` together.
+3. Add a `## [X.Y.Z] - date` section to `CHANGELOG.md` (it becomes the
+   GitHub release notes).
+4. Commit, merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+5. The workflow: verifies tag == workspace version, extracts the changelog
+   section, runs `cargo package --workspace`, exchanges the job's OIDC token
+   for a short-lived crates.io token (`rust-lang/crates-io-auth-action`, revoked
+   in its post step), runs `cargo publish --workspace` (orders and waits for
+   indexing; needs cargo >= 1.90) and creates the GitHub release.
+6. Confirm the docs.rs builds succeeded.
+
+Publishing is permanent: a version can be yanked but never deleted or
+re-uploaded. A failed run after publish (for example the GitHub release step)
+must be finished by hand, never by re-tagging.
+
+### Manual fallback
+
+If the workflow itself is broken, publish from a laptop:
+
+```bash
+cargo package --workspace
+cargo login                      # token scoped to publish-new + publish-update for warpline*
+cargo publish --workspace        # or, in order: warpline-core, warpline-control, warpline-host
+```
+
+Then tag and release without re-running the publish: create the tag on
+GitHub with `gh release create vX.Y.Z --notes-file <changelog section>`
+after the crates are out. (Pushing the tag also triggers the workflow, whose
+publish step then fails harmlessly on the already-published version.)
 
 ## Open decisions
 

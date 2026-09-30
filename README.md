@@ -18,6 +18,10 @@
 
 ## Embedding warpline in your app
 
+A complete reference integration (axum app, per-merchant hooks, Postgres,
+docker compose, end-to-end demo) lives in
+[`examples/storefront`](examples/storefront).
+
 `warpline-core` is a library: hold a `Runtime`, publish components under
 `(tenant, function)` names and invoke them. Add the dependencies:
 
@@ -546,6 +550,18 @@ Out of scope for the current runtime, tracked for a later phase:
 - **Hyperlight** — sub-millisecond ephemeral instances (Microsoft, Mar
   2025) as a possible alternative isolation boundary; write-up candidate if
   it lands.
+
+## Releasing
+
+1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and the
+   `version = "..."` of the path dependencies in `crates/*/Cargo.toml`.
+2. Move the `CHANGELOG.md` entries to a new `## [X.Y.Z] - date` section.
+3. Commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+
+The `release` workflow checks that the tag matches the version, runs
+`cargo package --workspace`, publishes to crates.io through trusted
+publishing (no stored token) and creates the GitHub release from the
+changelog section. See `docs/plans/2026-09-28-publishing.md`.
 
 ## License <a id="license"></a>
 

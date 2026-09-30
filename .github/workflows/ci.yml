@@ -127,3 +127,72 @@ jobs:
       # run and committed.
       - name: Fail if the committed fixture is stale
         run: git diff --exit-code -- crates/core/tests/fixtures/test_guest.wasm
+
+  example:
+    name: examples/storefront
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: storefront
+          POSTGRES_PASSWORD: storefront
+          POSTGRES_DB: storefront
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U storefront -d storefront"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WARPLINE_TEST_DATABASE_URL: postgres://storefront:storefront@localhost:5432/storefront
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain (examples/rust-toolchain.toml)
+        working-directory: examples
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            examples/storefront/app
+            examples/storefront/hook
+      - name: Rebuild the hook; fail if the committed fixture is stale
+        run: |
+          examples/storefront/build.sh
+          git diff --exit-code -- examples/storefront/app/tests/fixtures/checkout_hook.wasm
+      - name: app fmt
+        working-directory: examples/storefront/app
+        run: cargo fmt --check
+      - name: app clippy
+        working-directory: examples/storefront/app
+        run: cargo clippy --all-targets -- -D warnings
+      - name: app tests
+        working-directory: examples/storefront/app
+        run: cargo test
+      - name: hook fmt
+        working-directory: examples/storefront/hook
+        run: cargo fmt --check
+      - name: hook clippy
+        working-directory: examples/storefront/hook
+        run: cargo clippy --target wasm32-wasip2 -- -D warnings
+      # The same walkthrough as `./demo.sh --up`, minus docker compose: the
+      # binaries run on the runner and share the Postgres service above.
+      - name: Live demo
+        working-directory: examples/storefront/app
+        env:
+          DATABASE_URL: postgres://storefront:storefront@localhost:5432/storefront
+          ADMIN_TOKEN: demo-admin-token
+          FRAUD_API: http://127.0.0.1:3100
+          MODULES_DIR: ${{ runner.temp }}/modules
+        run: |
+          cargo build --release --bins
+          ./target/release/fraud-mock > "$RUNNER_TEMP/fraud.log" 2>&1 &
+          ./target/release/storefront > "$RUNNER_TEMP/storefront.log" 2>&1 &
+          trap 'echo "--- fraud-mock"; cat "$RUNNER_TEMP/fraud.log"; echo "--- storefront"; cat "$RUNNER_TEMP/storefront.log"' EXIT
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/healthz
+          FRAUD_HOST=127.0.0.1 ../demo.sh
