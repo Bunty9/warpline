@@ -3382,7 +3382,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "lru",
  "reqwest",
