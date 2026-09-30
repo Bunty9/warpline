@@ -7,21 +7,26 @@
 //!   [`runtime::invoke`].
 //! - [`kv`] — [`kv::KvStore`] trait + in-memory implementation, scoped per
 //!   tenant by [`types::HostCtx`].
-//! - [`meter`] — Postgres-backed per-invocation metering writer.
+//! - [`meter`] — [`Usage`] and the [`MeterSink`] trait invocations report to.
 //! - [`cache`] — content-hash `.cwasm` cache on local disk, now over
 //!   `wasmtime::component::Component`.
 //! - [`registry`] — pointer files mapping `(tenant, func)` to a content
 //!   digest, plus the in-memory `Component` LRU built on top of `cache`.
-//! - [`auth`] — bearer-token auth, per-tenant config, and the
-//!   optional-Postgres bootstrap shared by `warpline-host` and
-//!   `warpline-control`.
+//! - `pg` (feature `postgres`, on by default) — everything Postgres:
+//!   schema-isolated migrations, bearer-token auth, tenant admin and the
+//!   batching [`MeterSink`]. Nothing in this crate reads environment
+//!   variables or migrates implicitly.
 //! - [`types`] — [`types::HostCtx`] and [`types::TenantLimiter`], the
 //!   per-invocation state attached to every `Store`.
 
-pub mod auth;
 pub mod cache;
 pub mod kv;
 pub mod meter;
+#[cfg(feature = "postgres")]
+pub mod pg;
 pub mod registry;
 pub mod runtime;
 pub mod types;
+
+pub use meter::{MeterSink, Usage};
+pub use types::Limits;

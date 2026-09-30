@@ -16,8 +16,8 @@ use axum::http::{Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
-use warpline_core::auth::DbState;
 use warpline_core::kv::MemKv;
+use warpline_core::pg::{self, Authenticator, PgMeter};
 use warpline_core::registry::ComponentCache;
 use warpline_core::runtime::{build_engine, build_http_client, build_linker, EpochTicker};
 
@@ -27,6 +27,17 @@ const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
 ));
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Migrated pool plus an authenticator with the cache off, so config changes
+/// are visible immediately.
+async fn connect(url: &str) -> (sqlx::PgPool, Authenticator) {
+    let pool = sqlx::PgPool::connect(url)
+        .await
+        .expect("connect to test db");
+    pg::migrate(&pool).await.expect("migrate");
+    let auth = Authenticator::new(pool.clone(), Duration::ZERO);
+    (pool, auth)
+}
 
 fn unique_tenant(label: &str) -> String {
     let nanos = SystemTime::now()
@@ -39,10 +50,11 @@ fn unique_tenant(label: &str) -> String {
 
 macro_rules! require_test_db {
     () => {{
-        let Ok(url) = std::env::var("WARPLINE_TEST_DATABASE_URL") else {
+        let url = std::env::var("WARPLINE_TEST_DATABASE_URL").unwrap_or_default();
+        if url.is_empty() {
             eprintln!("skipping: WARPLINE_TEST_DATABASE_URL not set");
             return;
-        };
+        }
         url
     }};
 }
@@ -148,7 +160,7 @@ async fn invoke(
 #[tokio::test]
 async fn auth_config_and_metering_against_real_postgres() {
     let url = require_test_db!();
-    let db = DbState::connect_to(&url).await.expect("connect to test db");
+    let (pool, auth) = connect(&url).await;
 
     let engine = build_engine().expect("build engine");
     let linker = build_linker(&engine).expect("build linker");
@@ -158,16 +170,13 @@ async fn auth_config_and_metering_against_real_postgres() {
         engine.clone(),
         linker.clone(),
         dir.path().to_path_buf(),
-        db.clone(),
+        Some(auth.clone()),
     );
     control_state.admin_token = Some("test-admin-token".to_string());
     let control = warpline_control::router(control_state);
 
     let ticker = EpochTicker::spawn(engine.clone());
-    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
-        db.clone(),
-        warpline_core::meter::METER_CHANNEL_CAPACITY,
-    );
+    let (meter, _meter_handle) = PgMeter::spawn(pool.clone(), 10_000);
     let host_state = warpline_host::AppState {
         engine,
         linker,
@@ -179,10 +188,10 @@ async fn auth_config_and_metering_against_real_postgres() {
         // test server; the guarded resolver would otherwise refuse it
         // regardless of the tenant's own allowlist.
         allow_private_egress: true,
-        db: db.clone(),
+        auth: Some(auth),
         metrics_handle: warpline_host::metrics_handle(),
         ticker: Arc::new(ticker),
-        meter_tx,
+        meter: Arc::new(meter),
     };
     let host = warpline_host::router(host_state);
 
@@ -248,16 +257,15 @@ async fn auth_config_and_metering_against_real_postgres() {
     // amount then trusting insertion order (`ORDER BY id DESC`), which a
     // batched, concurrently-running writer doesn't guarantee lines up with
     // wall-clock call order.
-    let pool = db.pool().expect("postgres pool");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut failed_count = 0i64;
     while Instant::now() < deadline {
         failed_count = sqlx::query_scalar(
-            "SELECT count(*) FROM meter WHERE tenant = $1 AND func = $2 AND ok = false",
+            "SELECT count(*) FROM warpline.meter WHERE tenant = $1 AND func = $2 AND ok = false",
         )
         .bind(&tenant_a)
         .bind("echo")
-        .fetch_one(pool)
+        .fetch_one(&pool)
         .await
         .expect("query meter table");
         if failed_count >= 1 {
@@ -277,7 +285,7 @@ async fn auth_config_and_metering_against_real_postgres() {
 #[tokio::test]
 async fn admin_cpu_budget_config_is_enforced_and_persisted() {
     let url = require_test_db!();
-    let db = DbState::connect_to(&url).await.expect("connect to test db");
+    let (pool, auth) = connect(&url).await;
 
     let engine = build_engine().expect("build engine");
     let linker = build_linker(&engine).expect("build linker");
@@ -287,16 +295,13 @@ async fn admin_cpu_budget_config_is_enforced_and_persisted() {
         engine.clone(),
         linker.clone(),
         dir.path().to_path_buf(),
-        db.clone(),
+        Some(auth.clone()),
     );
     control_state.admin_token = Some("test-admin-token".to_string());
     let control = warpline_control::router(control_state);
 
     let ticker = EpochTicker::spawn(engine.clone());
-    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
-        db.clone(),
-        warpline_core::meter::METER_CHANNEL_CAPACITY,
-    );
+    let (meter, _meter_handle) = PgMeter::spawn(pool.clone(), 10_000);
     let host_state = warpline_host::AppState {
         engine,
         linker,
@@ -305,10 +310,10 @@ async fn admin_cpu_budget_config_is_enforced_and_persisted() {
         kv: Arc::new(MemKv::new()),
         http_client: build_http_client(true).expect("build http client"),
         allow_private_egress: true,
-        db: db.clone(),
+        auth: Some(auth),
         metrics_handle: warpline_host::metrics_handle(),
         ticker: Arc::new(ticker),
-        meter_tx,
+        meter: Arc::new(meter),
     };
     let host = warpline_host::router(host_state);
 
@@ -330,11 +335,10 @@ async fn admin_cpu_budget_config_is_enforced_and_persisted() {
         String::from_utf8_lossy(&body)
     );
 
-    let pool = db.pool().expect("postgres pool");
     let (persisted_cpu_budget_ms,): (i32,) =
-        sqlx::query_as("SELECT cpu_budget_ms FROM tenants WHERE name = $1")
+        sqlx::query_as("SELECT cpu_budget_ms FROM warpline.tenants WHERE name = $1")
             .bind(&tenant)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
             .expect("tenant row");
     assert_eq!(persisted_cpu_budget_ms, 1);

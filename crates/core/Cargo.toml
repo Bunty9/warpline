@@ -15,6 +15,11 @@ readme = "../../README.md"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["postgres"]
+# Postgres-backed auth, tenant admin and metering (`warpline_core::pg`).
+postgres = ["dep:sqlx", "dep:getrandom"]
+
 [dependencies]
 tokio = { workspace = true }
 wasmtime = { workspace = true }
@@ -24,14 +29,14 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
-uuid = { workspace = true }
 lru = { workspace = true }
 
 [dev-dependencies]

@@ -5,14 +5,14 @@
 //! functions against the same database never collide.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use warpline_control::{router, AppState};
-use warpline_core::auth::DbState;
+use warpline_core::pg::{self, Authenticator};
 use warpline_core::runtime::{build_engine, build_linker};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -33,19 +33,24 @@ fn unique_tenant(label: &str) -> String {
 /// isn't set, otherwise connects (and migrates) against it.
 macro_rules! require_test_db {
     () => {{
-        let Ok(url) = std::env::var("WARPLINE_TEST_DATABASE_URL") else {
+        let url = std::env::var("WARPLINE_TEST_DATABASE_URL").unwrap_or_default();
+        if url.is_empty() {
             eprintln!("skipping: WARPLINE_TEST_DATABASE_URL not set");
             return;
-        };
-        DbState::connect_to(&url).await.expect("connect to test db")
+        }
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to test db");
+        pg::migrate(&pool).await.expect("migrate");
+        Authenticator::new(pool, Duration::ZERO)
     }};
 }
 
-async fn state(db: DbState, admin_token: Option<&str>) -> (AppState, tempfile::TempDir) {
+async fn state(db: Authenticator, admin_token: Option<&str>) -> (AppState, tempfile::TempDir) {
     let engine = build_engine().expect("build engine");
     let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut state = AppState::new(engine, linker, dir.path().to_path_buf(), db);
+    let mut state = AppState::new(engine, linker, dir.path().to_path_buf(), Some(db));
     state.admin_token = admin_token.map(str::to_string);
     (state, dir)
 }

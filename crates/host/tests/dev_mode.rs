@@ -11,7 +11,6 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use warpline_core::auth::DbState;
 use warpline_core::kv::MemKv;
 use warpline_core::registry::ComponentCache;
 use warpline_core::runtime::{build_engine, build_http_client, build_linker, EpochTicker};
@@ -44,12 +43,7 @@ fn control_router(
     linker: wasmtime::component::Linker<warpline_core::types::HostCtx>,
     modules_dir: &Path,
 ) -> axum::Router {
-    let state = warpline_control::AppState::new(
-        engine,
-        linker,
-        modules_dir.to_path_buf(),
-        DbState::InsecureDev,
-    );
+    let state = warpline_control::AppState::new(engine, linker, modules_dir.to_path_buf(), None);
     warpline_control::router(state)
 }
 
@@ -59,10 +53,6 @@ fn host_router(
     modules_dir: &Path,
     ticker: EpochTicker,
 ) -> axum::Router {
-    let (meter_tx, _meter_handle) = warpline_core::meter::spawn_writer(
-        DbState::InsecureDev,
-        warpline_core::meter::METER_CHANNEL_CAPACITY,
-    );
     let state = warpline_host::AppState {
         engine,
         linker,
@@ -71,10 +61,10 @@ fn host_router(
         kv: Arc::new(MemKv::new()),
         http_client: build_http_client(true).expect("build http client"),
         allow_private_egress: false,
-        db: DbState::InsecureDev,
+        auth: None,
         metrics_handle: warpline_host::metrics_handle(),
         ticker: Arc::new(ticker),
-        meter_tx,
+        meter: Arc::new(warpline_host::LogMeter),
     };
     warpline_host::router(state)
 }

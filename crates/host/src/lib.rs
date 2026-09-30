@@ -1,7 +1,7 @@
 //! `warpline-host` — multi-tenant WASM function invocation server.
 //!
 //! Listens for `POST /tenants/{tenant}/functions/{func}/invoke`: auths the
-//! bearer token against `warpline_core::auth`, resolves `(tenant, func)` to
+//! bearer token against `warpline_core::pg::Authenticator`, resolves `(tenant, func)` to
 //! a `Component` through `warpline_core::registry` (a shared content-hash
 //! cache the control plane writes into — see `crates/control`), invokes it
 //! via `warpline_core::runtime::invoke`, writes a metering row off the
@@ -33,12 +33,12 @@ use wasmtime::component::Linker;
 use wasmtime::Engine;
 
 use warpline_core::{
-    auth::{authenticate, parse_bearer, AuthOutcome, DbState},
     kv::KvStore,
-    meter::{MeterMsg, MeterSender},
+    pg::{AuthOutcome, Authenticator},
     registry::{self, ComponentCache},
     runtime::{invoke, EpochTicker, InvokeError, InvokeOutcome},
-    types::{valid_name, HostCtx},
+    types::{parse_bearer, valid_name, HostCtx},
+    Limits, MeterSink, Usage,
 };
 
 /// Request body size cap for `/invoke`.
@@ -54,15 +54,25 @@ pub struct AppState {
     pub kv: Arc<dyn KvStore>,
     pub http_client: reqwest::Client,
     pub allow_private_egress: bool,
-    pub db: DbState,
+    /// `None` = dev mode without Postgres: no auth, default limits.
+    pub auth: Option<Authenticator>,
     pub metrics_handle: PrometheusHandle,
     /// Keeps the engine's epoch-ticker thread alive for the process
     /// lifetime; never read, only held.
     pub ticker: Arc<EpochTicker>,
-    /// Sender half of the bounded metering channel — see
-    /// `warpline_core::meter`. Cloning is cheap; every request handler gets
-    /// its own clone via [`AppState`].
-    pub meter_tx: MeterSender,
+    /// Where completed invocations are reported — `pg::PgMeter` with a
+    /// database, [`LogMeter`] without.
+    pub meter: Arc<dyn MeterSink>,
+}
+
+/// Dev-mode [`MeterSink`]: logs at debug level instead of storing.
+#[derive(Debug, Default)]
+pub struct LogMeter;
+
+impl MeterSink for LogMeter {
+    fn record(&self, tenant: &str, func: &str, usage: Usage, ok: bool) {
+        tracing::debug!(%tenant, %func, ?usage, ok, "invoke completed (metering disabled)");
+    }
 }
 
 static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -136,14 +146,16 @@ async fn invoke_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bearer);
-    let authed = match authenticate(&state.db, &tenant, bearer).await {
-        Ok(AuthOutcome::Ok(a)) => a,
-        Ok(AuthOutcome::Unauthorized) => {
-            return (StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response()
-        }
-        Ok(AuthOutcome::Forbidden) => {
+    let outcome = match &state.auth {
+        Some(auth) => auth.authenticate(&tenant, bearer).await,
+        None => Ok(AuthOutcome::Authorized(Limits::default())),
+    };
+    let limits = match outcome {
+        Ok(AuthOutcome::Authorized(l)) => l,
+        Ok(AuthOutcome::WrongTenant) => {
             return (StatusCode::FORBIDDEN, "forbidden".to_string()).into_response()
         }
+        Ok(_) => return (StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "auth error".to_string()).into_response();
@@ -182,10 +194,10 @@ async fn invoke_handler(
         tenant.clone(),
         func.clone(),
         state.kv.clone(),
-        authed.config.allowed_hosts.clone(),
+        limits.allowed_hosts.clone(),
         state.allow_private_egress,
         state.http_client.clone(),
-        authed.config.mem_cap_bytes,
+        limits.mem_cap_bytes,
     );
 
     let wall_started = Instant::now();
@@ -194,7 +206,7 @@ async fn invoke_handler(
         &pre,
         ctx,
         body.to_vec(),
-        authed.config.cpu_budget_ms,
+        limits.cpu_budget_ms,
     )
     .await;
     let wall_us = wall_started.elapsed().as_micros() as u64;
@@ -223,26 +235,20 @@ async fn invoke_handler(
     // Best-effort metering fields for the error path: `cpu_us` falls back
     // to wall time (no epoch-derived figure survives a failed call) and
     // `mem_peak_bytes` is only known when the limiter is what tripped.
+    // `cpu_us` is still a wall-clock measurement everywhere for now.
     let (cpu_us, mem_peak_bytes, ok) = match &result {
         Ok(o) => (o.cpu_us, o.mem_peak_bytes, true),
         Err(InvokeError::MemoryCapExceeded { peak_bytes, .. }) => (wall_us, *peak_bytes, false),
         Err(_) => (wall_us, 0, false),
     };
-    // Queued onto the bounded metering channel rather than a per-invoke
-    // `tokio::spawn` (finding 5): a burst of invokes no longer spawns one
-    // task + one Postgres write per request. A full channel means this row
-    // is dropped, counted via `warpline_meter_dropped_total`, rather than
-    // blocking the response or growing the channel without bound.
-    let row = MeterMsg {
-        tenant: tenant.clone(),
-        func: func.clone(),
-        cpu_us,
-        mem_peak_bytes,
+    // `record` never blocks; a sink that cannot keep up counts its own drops
+    // (`PgMeter::dropped`).
+    state.meter.record(
+        &tenant,
+        &func,
+        Usage::new(cpu_us, wall_us, mem_peak_bytes),
         ok,
-    };
-    if state.meter_tx.try_send(row).is_err() {
-        metrics::counter!("warpline_meter_dropped_total").increment(1);
-    }
+    );
 
     match result {
         Ok(outcome) => (StatusCode::OK, outcome.output).into_response(),

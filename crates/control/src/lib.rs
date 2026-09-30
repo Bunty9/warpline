@@ -10,10 +10,11 @@
 //!   source `.wasm` + compiled `.cwasm` and publishes the `(tenant, func)`
 //!   pointer — in DB mode, inside one transaction that also enforces the
 //!   per-tenant function quota (see `publish_pointer`).
-//! - `POST /admin/tenants/{tenant}` (guarded by `WARPLINE_ADMIN_TOKEN`)
-//!   creates a tenant idempotently, optionally sets its resource config,
-//!   and issues a new API key — tenant upsert, config update and key insert
-//!   all happen in one transaction.
+//! - `POST /admin/tenants/{tenant}` (guarded by the admin token) creates a
+//!   tenant idempotently, optionally sets its resource limits, and issues a
+//!   new API key via `warpline_core::pg::create_tenant` (one transaction).
+//!   Fields left out of the body take the default limits when a body is
+//!   sent at all.
 //! - `GET /healthz`.
 //!
 //! Split into this lib (state + [`router`]) and a thin `main.rs` so
@@ -36,13 +37,12 @@ use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
 use warpline_core::{
-    auth::{authenticate, parse_bearer, AuthOutcome, DbState},
-    cache::{self, digest},
+    cache,
+    pg::{self, AdminError, AuthOutcome, Authenticator},
     registry,
     runtime::typecheck_component,
-    types::{
-        valid_name, validate_allowed_hosts, validate_cpu_budget_ms, validate_mem_cap_bytes, HostCtx,
-    },
+    types::{parse_bearer, valid_name, validate_cpu_budget_ms, validate_mem_cap_bytes, HostCtx},
+    Limits,
 };
 
 /// Multipart upload size cap.
@@ -60,9 +60,11 @@ pub struct AppState {
     pub engine: Engine,
     pub linker: Linker<HostCtx>,
     pub modules_dir: PathBuf,
-    pub db: DbState,
-    /// `WARPLINE_ADMIN_TOKEN`, or `None` if unset — the admin route is
-    /// disabled (404) in that case.
+    /// `None` = dev mode without Postgres: no auth, default limits, no admin
+    /// API. The pool is reached through [`Authenticator::pool`].
+    pub auth: Option<Authenticator>,
+    /// Admin bearer token, or `None` — the admin route is disabled (404) in
+    /// that case. Set by the binary (from `WARPLINE_ADMIN_TOKEN`).
     pub admin_token: Option<String>,
     /// Bounds concurrent `spawn_blocking` compiles process-wide (finding
     /// 2) — a burst of uploads shouldn't be able to spin up an unbounded
@@ -76,10 +78,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(engine: Engine, linker: Linker<HostCtx>, modules_dir: PathBuf, db: DbState) -> Self {
-        let admin_token = std::env::var("WARPLINE_ADMIN_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
+    pub fn new(
+        engine: Engine,
+        linker: Linker<HostCtx>,
+        modules_dir: PathBuf,
+        auth: Option<Authenticator>,
+    ) -> Self {
         let permits = (std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -89,8 +93,8 @@ impl AppState {
             engine,
             linker,
             modules_dir,
-            db,
-            admin_token,
+            auth,
+            admin_token: None,
             compile_semaphore: Arc::new(Semaphore::new(permits)),
             max_functions_per_tenant: DEFAULT_MAX_FUNCTIONS_PER_TENANT,
         }
@@ -129,14 +133,16 @@ async fn upload(
             .into_response();
     }
 
-    let authed = match authenticate(&state.db, &tenant, bearer_from(&headers)).await {
-        Ok(AuthOutcome::Ok(a)) => a,
-        Ok(AuthOutcome::Unauthorized) => {
-            return (StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response()
-        }
-        Ok(AuthOutcome::Forbidden) => {
+    let outcome = match &state.auth {
+        Some(auth) => auth.authenticate(&tenant, bearer_from(&headers)).await,
+        None => Ok(AuthOutcome::Authorized(Limits::default())),
+    };
+    match outcome {
+        Ok(AuthOutcome::Authorized(_)) => {}
+        Ok(AuthOutcome::WrongTenant) => {
             return (StatusCode::FORBIDDEN, "forbidden".to_string()).into_response()
         }
+        Ok(_) => return (StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "auth error".to_string()).into_response();
@@ -253,9 +259,7 @@ async fn upload(
         }
     }
 
-    if let Err((status, msg)) =
-        publish_pointer(&state, &tenant, &func, authed.id, &wasm_digest).await
-    {
+    if let Err((status, msg)) = publish_pointer(&state, &tenant, &func, &wasm_digest).await {
         return (status, msg).into_response();
     }
 
@@ -297,16 +301,15 @@ async fn upload(
 /// with no pointer yet) just 404s until the write is retried, which is the
 /// harmless direction to fail in.
 ///
-/// In `InsecureDev` (no database, no tenant id), there is nothing to lock
-/// or upsert against, so this just writes the pointer.
+/// Without a database (dev mode), there is nothing to lock or upsert
+/// against, so this just writes the pointer.
 async fn publish_pointer(
     state: &AppState,
     tenant: &str,
     func: &str,
-    tenant_id: Option<uuid::Uuid>,
     wasm_digest: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let (DbState::Postgres(pool), Some(tenant_id)) = (&state.db, tenant_id) else {
+    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
         return registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(
             |e| {
                 tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
@@ -340,14 +343,22 @@ async fn publish_pointer(
         .await
         .map_err(|e| internal_error(e, "failed to take publish lock"))?;
 
-    let max_functions = state.max_functions_per_tenant;
-    let other_functions: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM functions WHERE tenant_id = $1 AND name <> $2")
-            .bind(tenant_id)
-            .bind(func)
+    let tenant_id: sqlx::types::Uuid =
+        sqlx::query_scalar("SELECT id FROM warpline.tenants WHERE name = $1")
+            .bind(tenant)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| internal_error(e, "failed to check function quota"))?;
+            .map_err(|e| internal_error(e, "failed to look up tenant"))?;
+
+    let max_functions = state.max_functions_per_tenant;
+    let other_functions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM warpline.functions WHERE tenant_id = $1 AND name <> $2",
+    )
+    .bind(tenant_id)
+    .bind(func)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| internal_error(e, "failed to check function quota"))?;
     if other_functions >= max_functions {
         // `tx` drops here without a commit, rolling back the advisory lock
         // release included.
@@ -358,7 +369,7 @@ async fn publish_pointer(
     }
 
     sqlx::query(
-        "INSERT INTO functions (tenant_id, name, wasm_hash) VALUES ($1, $2, $3) \
+        "INSERT INTO warpline.functions (tenant_id, name, wasm_hash) VALUES ($1, $2, $3) \
          ON CONFLICT (tenant_id, name) DO UPDATE SET wasm_hash = EXCLUDED.wasm_hash",
     )
     .bind(tenant_id)
@@ -412,7 +423,7 @@ async fn admin_create_tenant(
     body: Bytes,
 ) -> impl IntoResponse {
     let Some(expected_token) = &state.admin_token else {
-        // No WARPLINE_ADMIN_TOKEN configured: the route doesn't exist.
+        // No admin token configured: the route doesn't exist.
         return StatusCode::NOT_FOUND.into_response();
     };
     let provided = bearer_from(&headers);
@@ -423,7 +434,7 @@ async fn admin_create_tenant(
         return (StatusCode::BAD_REQUEST, "invalid tenant name".to_string()).into_response();
     }
 
-    let DbState::Postgres(pool) = &state.db else {
+    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "admin API requires DATABASE_URL".to_string(),
@@ -441,87 +452,46 @@ async fn admin_create_tenant(
             }
         }
     };
-    // Normalized (lowercased, trailing-dot-trimmed) form is what gets
-    // stored — see `validate_allowed_hosts` (finding 9): storing the raw
-    // input would let an allowlist entry silently never match the
-    // already-normalized host `http-out::fetch` compares it against.
-    let normalized_hosts: Option<Vec<String>> = match &cfg.allowed_hosts {
-        Some(hosts) => match validate_allowed_hosts(hosts) {
-            Ok(v) => Some(v),
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        },
-        None => None,
+    // No fields -> leave an existing tenant's limits alone. Otherwise the
+    // body describes the tenant's limits, unspecified fields at defaults.
+    // Range checks run on the raw i64s so negatives get a proper 400;
+    // `create_tenant` validates hosts again and stores them normalised.
+    let limits = if cfg.allowed_hosts.is_none()
+        && cfg.cpu_budget_ms.is_none()
+        && cfg.mem_cap_bytes.is_none()
+    {
+        None
+    } else {
+        let mut l = Limits::default();
+        if let Some(ms) = cfg.cpu_budget_ms {
+            if let Err(e) = validate_cpu_budget_ms(ms) {
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+            l.cpu_budget_ms = ms as u64;
+        }
+        if let Some(b) = cfg.mem_cap_bytes {
+            if let Err(e) = validate_mem_cap_bytes(b) {
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+            l.mem_cap_bytes = b as usize;
+        }
+        if let Some(hosts) = cfg.allowed_hosts {
+            l.allowed_hosts = hosts;
+        }
+        Some(l)
     };
-    if let Some(ms) = cfg.cpu_budget_ms {
-        if let Err(e) = validate_cpu_budget_ms(ms) {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    }
-    if let Some(b) = cfg.mem_cap_bytes {
-        if let Err(e) = validate_mem_cap_bytes(b) {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    }
 
-    let mut key_bytes = [0u8; 32];
-    if let Err(e) = getrandom::fill(&mut key_bytes) {
-        tracing::error!(error = %e, "getrandom failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        )
-            .into_response();
-    }
-    let api_key = format!("wl_{}", hex::encode(key_bytes));
-    let key_hash = digest(api_key.as_bytes());
-
-    // Tenant upsert + config update + key insert as one unit (finding 11):
-    // a failure partway through must not leave e.g. a tenant row with no
-    // usable key, or a key issued against a config update that never
-    // landed.
-    let result: Result<(), sqlx::Error> = async {
-        let mut tx = pool.begin().await?;
-        let tenant_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (name) VALUES ($1) \
-             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
-             RETURNING id",
-        )
-        .bind(&tenant)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "UPDATE tenants SET \
-                allowed_hosts = COALESCE($2, allowed_hosts), \
-                cpu_budget_ms = COALESCE($3, cpu_budget_ms), \
-                mem_cap_bytes = COALESCE($4, mem_cap_bytes) \
-             WHERE id = $1",
-        )
-        .bind(tenant_id)
-        .bind(&normalized_hosts)
-        .bind(cfg.cpu_budget_ms.map(|v| v as i32))
-        .bind(cfg.mem_cap_bytes)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("INSERT INTO api_keys (key_hash, tenant_id) VALUES ($1, $2)")
-            .bind(&key_hash)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await
-    }
-    .await;
-
-    match result {
-        Ok(()) => {
+    match pg::create_tenant(pool, &tenant, limits.as_ref()).await {
+        Ok(key) => {
             tracing::info!(%tenant, "tenant created/updated, api key issued");
             (
                 StatusCode::CREATED,
-                axum::Json(serde_json::json!({ "tenant": tenant, "api_key": api_key })),
+                axum::Json(serde_json::json!({ "tenant": key.tenant, "api_key": key.api_key })),
             )
                 .into_response()
+        }
+        Err(e @ (AdminError::Config(_) | AdminError::InvalidName)) => {
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
         Err(e) => {
             tracing::error!(%tenant, error = %e, "failed to create/update tenant");

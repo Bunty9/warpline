@@ -94,7 +94,7 @@ which is enough for a one-box deploy (see "Roadmap / deferred").
 Every cap below is enforced per invocation or per tenant. Values marked
 "configurable" come from the `tenants` table (`admin_create_tenant`,
 validated against the ranges in `warpline_core::types`) and default to
-[`TenantConfig::dev_default`](crates/core/src/auth.rs) under
+[`Limits::default`](crates/core/src/types.rs) under
 `WARPLINE_INSECURE_DEV=1`.
 
 | Cap                                             | Value                                          | Enforced by |
@@ -272,8 +272,8 @@ Every environment variable either binary reads, with its default:
 
 | Variable                        | Read by         | Default                                                | Purpose |
 | -------------------------------- | ---------------- | ------------------------------------------------------- | ------- |
-| `DATABASE_URL`                  | host, control    | unset (refuses to start unless `WARPLINE_INSECURE_DEV=1`) | Postgres connection string. Enables auth, tenant config, and metering; runs migrations on boot. |
-| `WARPLINE_INSECURE_DEV`         | host, control    | unset                                                    | Set to `1` to run without Postgres: no auth enforced, every tenant gets `TenantConfig::dev_default` (empty allowlist, 100 ms CPU, 64 MiB memory), invocations are logged at debug level instead of metered. Not for production. |
+| `DATABASE_URL`                  | host, control    | unset (refuses to start unless `WARPLINE_INSECURE_DEV=1`) | Postgres connection string. Enables auth, tenant limits, and metering; the binaries run `pg::migrate` on boot (everything lives in the `warpline` schema). |
+| `WARPLINE_INSECURE_DEV`         | host, control    | unset                                                    | Set to `1` to run without Postgres: no auth enforced, every tenant gets `Limits::default` (empty allowlist, 100 ms CPU, 64 MiB memory), invocations are logged at debug level instead of metered. Not for production. |
 | `WARPLINE_ADMIN_TOKEN`          | control (host if embedded) | unset (`/admin/tenants/{tenant}` 404s)                   | Bearer token guarding the admin route. |
 | `WARPLINE_MODULES_DIR`          | host, control    | `./modules`                                              | Root of the shared module registry (`wasm/`, `cwasm/`, `tenants/`). |
 | `WARPLINE_HOST_BIND`            | host             | `127.0.0.1:8080` under `WARPLINE_INSECURE_DEV`, else `0.0.0.0:8080` | `warpline-host`'s invoke-API listen address. |

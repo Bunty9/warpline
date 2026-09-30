@@ -4,10 +4,11 @@
 //! socket.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use warpline_control::{router, AppState};
 use warpline_core::{
-    auth::DbState,
+    pg::{self, Authenticator},
     registry,
     runtime::{build_engine, build_linker},
 };
@@ -22,13 +23,13 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let db = DbState::connect().await?;
-    let insecure_dev = matches!(db, DbState::InsecureDev);
+    let auth = connect_auth().await?;
+    let insecure_dev = auth.is_none();
     let engine = build_engine()?;
     let linker = build_linker(&engine)?;
-    let modules_dir = std::env::var("WARPLINE_MODULES_DIR")
+    let modules_dir = env_nonempty("WARPLINE_MODULES_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./modules"));
+        .unwrap_or_else(|| PathBuf::from("./modules"));
     std::fs::create_dir_all(&modules_dir)?;
 
     // Run once, before serving: clean up any wasm/cwasm blob no pointer
@@ -39,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "startup GC failed"),
     }
 
-    let state = AppState::new(engine, linker, modules_dir, db);
+    let mut state = AppState::new(engine, linker, modules_dir, auth);
+    state.admin_token = env_nonempty("WARPLINE_ADMIN_TOKEN");
     let app = router(state);
 
     // InsecureDev has no auth in front of it; don't default to a
@@ -49,9 +51,44 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "0.0.0.0:8081"
     };
-    let bind = std::env::var("WARPLINE_CONTROL_BIND").unwrap_or_else(|_| default_bind.to_string());
+    let bind = env_nonempty("WARPLINE_CONTROL_BIND").unwrap_or_else(|| default_bind.to_string());
     tracing::info!(%bind, "warpline-control starting");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// An environment variable, treating empty as unset.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// `DATABASE_URL` set: connect, migrate and build the authenticator.
+/// Unset: only allowed with `WARPLINE_INSECURE_DEV=1` (returns `None`).
+async fn connect_auth() -> anyhow::Result<Option<Authenticator>> {
+    let Some(url) = env_nonempty("DATABASE_URL") else {
+        anyhow::ensure!(
+            env_nonempty("WARPLINE_INSECURE_DEV").as_deref() == Some("1"),
+            "DATABASE_URL is not set. Refusing to start without a database \
+             (no auth would be enforced and no invocations would be metered). \
+             Set WARPLINE_INSECURE_DEV=1 to run without one in local dev."
+        );
+        tracing::warn!(
+            "WARPLINE_INSECURE_DEV=1: starting without Postgres — no auth is \
+             enforced and every tenant gets the default resource caps. Do not \
+             run this in production."
+        );
+        return Ok(None);
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        // Fail fast rather than queueing every request behind a saturated pool.
+        .acquire_timeout(Duration::from_secs(2))
+        .connect(&url)
+        .await?;
+    pg::migrate(&pool).await?;
+    let ttl = env_nonempty("WARPLINE_AUTH_CACHE_TTL_SECS")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    Ok(Some(Authenticator::new(pool, Duration::from_secs(ttl))))
 }

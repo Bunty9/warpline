@@ -33,7 +33,7 @@ pub fn valid_name(s: &str) -> bool {
 
 /// Valid range for a tenant's `cpu_budget_ms`, milliseconds — mirrored by
 /// the `CHECK` constraint on `tenants.cpu_budget_ms` in
-/// `crates/core/migrations/0002_auth_config.sql`.
+/// `crates/core/migrations/0001_warpline.sql`.
 pub const MIN_CPU_BUDGET_MS: i64 = 1;
 pub const MAX_CPU_BUDGET_MS: i64 = 10_000;
 /// Valid range for a tenant's `mem_cap_bytes` — mirrored by the `CHECK`
@@ -99,6 +99,63 @@ pub fn validate_allowed_hosts(hosts: &[String]) -> Result<Vec<String>, ConfigErr
                 .to_string())
         })
         .collect()
+}
+
+/// Per-tenant resource limits: CPU budget, memory cap and the outbound-HTTP
+/// host allowlist. Fields are public to read; build one through
+/// [`Limits::new`] / [`Limits::with_allowed_hosts`] so the ranges above are
+/// enforced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Limits {
+    pub cpu_budget_ms: u64,
+    pub mem_cap_bytes: usize,
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for Limits {
+    /// 100 ms CPU, 64 MiB memory, no outbound hosts.
+    fn default() -> Self {
+        Self {
+            cpu_budget_ms: 100,
+            mem_cap_bytes: 64 * 1024 * 1024,
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+impl Limits {
+    /// Limits with no allowed hosts; errors if either value is out of range.
+    pub fn new(cpu_budget_ms: u64, mem_cap_bytes: usize) -> Result<Self, ConfigError> {
+        validate_cpu_budget_ms(i64::try_from(cpu_budget_ms).unwrap_or(i64::MAX))?;
+        validate_mem_cap_bytes(i64::try_from(mem_cap_bytes).unwrap_or(i64::MAX))?;
+        Ok(Self {
+            cpu_budget_ms,
+            mem_cap_bytes,
+            allowed_hosts: Vec::new(),
+        })
+    }
+
+    /// Set the outbound host allowlist, stored in normalised form
+    /// (lowercased, trailing dot trimmed) so it matches what `http-out`
+    /// compares against.
+    pub fn with_allowed_hosts(mut self, hosts: &[String]) -> Result<Self, ConfigError> {
+        self.allowed_hosts = validate_allowed_hosts(hosts)?;
+        Ok(self)
+    }
+}
+
+/// Strip a `"Bearer "` scheme from an `Authorization` header value. The
+/// scheme name is matched case-insensitively (RFC 7235 auth-schemes are
+/// case-insensitive) and the token is trimmed of surrounding whitespace;
+/// an empty token after trimming is treated as absent.
+pub fn parse_bearer(header_value: &str) -> Option<&str> {
+    let (scheme, rest) = header_value.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Per-invocation host context. See module docs.
@@ -295,8 +352,35 @@ impl wasmtime::ResourceLimiter for TenantLimiter {
 #[cfg(test)]
 mod tests {
     use super::{
-        valid_name, validate_allowed_hosts, validate_cpu_budget_ms, validate_mem_cap_bytes,
+        parse_bearer, valid_name, validate_allowed_hosts, validate_cpu_budget_ms,
+        validate_mem_cap_bytes, Limits,
     };
+
+    #[test]
+    fn limits_validate_and_normalise() {
+        assert_eq!(Limits::default().cpu_budget_ms, 100);
+        assert!(Limits::new(0, 64 << 20).is_err());
+        assert!(Limits::new(100, 1024).is_err());
+        assert!(Limits::new(u64::MAX, usize::MAX).is_err());
+        let l = Limits::new(5, 2 << 20)
+            .unwrap()
+            .with_allowed_hosts(&["Example.COM.".to_string()])
+            .unwrap();
+        assert_eq!(l.allowed_hosts, ["example.com"]);
+        assert!(Limits::default()
+            .with_allowed_hosts(&["bad host".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn parse_bearer_handles_scheme_case_and_whitespace() {
+        assert_eq!(parse_bearer("Bearer wl_abc"), Some("wl_abc"));
+        assert_eq!(parse_bearer("  bearer   wl_abc  "), Some("wl_abc"));
+        assert_eq!(parse_bearer("wl_abc"), None);
+        assert_eq!(parse_bearer("Basic abc"), None);
+        assert_eq!(parse_bearer("Bearer    "), None);
+        assert_eq!(parse_bearer(""), None);
+    }
 
     #[test]
     fn config_validators_accept_boundary_values_and_reject_outside_them() {
