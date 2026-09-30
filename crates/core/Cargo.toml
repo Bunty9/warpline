@@ -39,6 +39,8 @@ lru = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Hand-written WAT components in tests (e.g. a looping start function).
+wat = "1"
 
 [[bench]]
 name = "runtime"

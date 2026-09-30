@@ -15,12 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = "0.62"
 
-[features]
-# Adds a static initializer that spins forever, so instantiation itself never
-# returns (tests that instantiation is CPU-budgeted). Built into a separate
-# fixture, `spin_start_guest.wasm`, by `scripts/build-guests.sh`.
-spin-start = []
-
 [profile.release]
 opt-level = "s"
 lto = true

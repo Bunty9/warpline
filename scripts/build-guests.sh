@@ -24,11 +24,4 @@ cp \
     "$repo_root/examples/test-guest/target/wasm32-wasip2/release/test_guest.wasm" \
     "$fixtures_dir/test_guest.wasm"
 
-# Same guest plus a spinning static initializer (instantiation never returns).
-(cd "$repo_root/examples/test-guest" && cargo build --release --target wasm32-wasip2 \
-    --features spin-start --target-dir target-spin)
-cp \
-    "$repo_root/examples/test-guest/target-spin/wasm32-wasip2/release/test_guest.wasm" \
-    "$fixtures_dir/spin_start_guest.wasm"
-
-echo "updated $fixtures_dir/test_guest.wasm and spin_start_guest.wasm"
+echo "updated $fixtures_dir/test_guest.wasm"

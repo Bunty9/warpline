@@ -22,4 +22,3 @@ modules/
 .idea/
 .vscode/
 .DS_Store
-examples/test-guest/target-spin/

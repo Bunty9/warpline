@@ -515,11 +515,13 @@ async fn http_fetch(
 /// budget.
 const INSTANTIATE_GRACE_TICKS: u64 = 2;
 
-/// Instantiation is limited to `budget + 1 + grace` ticks. Afterwards the
-/// call's limit forgives at most the grace that instantiation used, so the
-/// whole invocation never exceeds `budget + 1 + grace` ticks.
+/// The callback traps on the tick *after* the limit (`n > limit`), so a limit
+/// of `budget` ticks means the guest is cut off in `(budget, budget + 1]` ms.
+/// Instantiation is limited to `budget + grace`. Afterwards the call's limit
+/// forgives at most the grace that instantiation used, so the whole
+/// invocation is cut off within `budget + grace + 1` ticks.
 fn call_limit(ticks_used_by_instantiation: u64, budget_ticks: u64) -> u64 {
-    ticks_used_by_instantiation.min(INSTANTIATE_GRACE_TICKS) + budget_ticks + 1
+    ticks_used_by_instantiation.min(INSTANTIATE_GRACE_TICKS) + budget_ticks
 }
 
 /// Marker error returned by the epoch deadline callback once a store's tick
@@ -603,7 +605,7 @@ pub(crate) async fn run(
         // one more tick. The deadline is re-based after each yield, so time
         // spent waiting to be re-polled is not counted. One extra tick is
         // allowed past the budget: the first tick is a partial one.
-        let limit = Arc::new(AtomicU64::new(budget_ticks + 1 + INSTANTIATE_GRACE_TICKS));
+        let limit = Arc::new(AtomicU64::new(budget_ticks + INSTANTIATE_GRACE_TICKS));
         let (ticks_cb, limit_cb) = (ticks.clone(), limit.clone());
         store.epoch_deadline_callback(move |_store| {
             let n = ticks_cb.fetch_add(1, Ordering::Relaxed) + 1;
@@ -722,10 +724,10 @@ mod tests {
         use super::{call_limit, INSTANTIATE_GRACE_TICKS as G};
         // The limit is an absolute tick count for the whole invocation.
         for budget in [1u64, 10, 100] {
-            for used in 0..=(budget + 1 + G) {
+            for used in 0..=(budget + G + 1) {
                 let total = call_limit(used, budget);
-                assert!(total <= budget + 1 + G, "budget {budget} used {used}");
-                assert!(total > budget, "budget {budget} used {used}");
+                assert!(total <= budget + G, "budget {budget} used {used}");
+                assert!(total >= budget, "budget {budget} used {used}");
             }
         }
     }

@@ -28,20 +28,6 @@ wit_bindgen::generate!({
 use warpline::host::http_out::{fetch, Request};
 use warpline::host::{kv, log};
 
-/// With `--features spin-start`: an `.init_array` entry, which wasm-ld runs from
-/// the module's `_initialize` during instantiation, before `handle` exists.
-#[cfg(feature = "spin-start")]
-#[used]
-#[link_section = ".init_array"]
-static SPIN_ON_INIT: extern "C" fn() = {
-    extern "C" fn spin() {
-        loop {
-            std::hint::black_box(());
-        }
-    }
-    spin
-};
-
 struct TestGuest;
 
 impl Guest for TestGuest {

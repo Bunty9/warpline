@@ -529,28 +529,41 @@ async fn dropping_a_handle_mid_invoke_does_not_stop_the_epoch() {
     );
 }
 
-/// A component whose static initializer spins forever never finishes
-/// instantiating. It must still be cut off, within budget + 1 tick + the
-/// instantiation grace (2 ticks), and the reported cpu_us must reflect that
-/// (no doubling of the budget between instantiation and call).
+/// A component whose core module has a `(start)` function that loops forever:
+/// instantiation itself never returns. It satisfies the handler world's
+/// `handle` export (and imports nothing), so it publishes and instantiates
+/// like any other. It must be cut off within budget + 1 tick + the
+/// instantiation grace (2 ticks).
+const SPIN_START_WAT: &str = r#"
+(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+    (func (export "handle") (param i32 i32) (result i32) i32.const 0)
+    (func $spin (loop $l (br $l)))
+    (start $spin))
+  (core instance $i (instantiate $m))
+  (func $h (param "input" (list u8)) (result (list u8))
+    (canon lift (core func $i "handle")
+      (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
+  (export "handle" (func $h)))
+"#;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spinning_start_function_is_cut_off_within_budget_plus_grace() {
-    const SPIN: &[u8] = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/spin_start_guest.wasm"
-    ));
+    let wasm = wat::parse_str(SPIN_START_WAT).expect("valid component WAT");
     let dir = tempfile::tempdir().unwrap();
     let rt = Runtime::new(config(dir.path())).unwrap();
-    rt.publish("tenant-a", FN, Bytes::from_static(SPIN))
+    rt.publish("tenant-a", FN, Bytes::from(wasm))
         .await
-        .unwrap();
+        .expect("spin component conforms to the handler world");
 
     let budget_ms = 50;
     let started = Instant::now();
     let err = rt
         .invoke("tenant-a", FN, b"x".to_vec(), &limits(budget_ms))
         .await
-        .expect_err("spinning initializer must be interrupted");
+        .expect_err("spinning start function must be interrupted");
     let elapsed = started.elapsed();
     assert!(
         matches!(err, InvokeError::CpuBudgetExceeded { .. }),

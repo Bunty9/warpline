@@ -20,7 +20,7 @@ use wasmtime::Engine;
 
 use crate::cache;
 use crate::kv::{KvStore, MemKv};
-use crate::registry::{self, ComponentCache};
+use crate::registry::{self, ComponentCache, Lookup};
 use crate::sandbox::{self, EpochTicker, Failure};
 use crate::types::{valid_name, HostCtx};
 use crate::{Error, InvokeError, Limits, MeterSink, PublishError, Usage};
@@ -126,19 +126,17 @@ impl RuntimeBuilder {
         let linker = Arc::new(sandbox::build_linker(&engine)?);
         let http_client = sandbox::build_http_client(cfg.allow_private_egress)
             .map_err(|e| Error::Internal(format!("failed to build http client: {e}")))?;
-        let compile_slots = Arc::new(Semaphore::new(cfg.compile_concurrency));
         let components = ComponentCache::new(
             engine.clone(),
             linker.clone(),
             cfg.modules_dir.clone(),
-            compile_slots.clone(),
             cfg.component_cache_entries,
             cfg.component_cache_bytes,
         );
         let ticker = EpochTicker::spawn(engine.clone());
         Ok(Runtime(Arc::new(Inner {
             admission: Arc::new(Semaphore::new(cfg.memory_budget_bytes / MIB)),
-            compile_slots,
+            compile_slots: Arc::new(Semaphore::new(cfg.compile_concurrency)),
             in_flight: Mutex::new(HashMap::new()),
             kv: self.kv.unwrap_or_else(|| Arc::new(MemKv::new())),
             meter: self.meter,
@@ -386,15 +384,48 @@ impl Runtime {
             .map_err(|_| InvokeError::Overloaded)?;
 
         let pre = {
-            let inner = inner.clone();
-            let (t, f) = (tenant.to_owned(), func.to_owned());
-            tokio::task::spawn_blocking(move || inner.components.resolve(&t, &f))
-                .await
-                .map_err(|e| {
-                    InvokeError::Load(Error::Internal(format!("resolve task failed: {e}")))
-                })?
-                .map_err(InvokeError::Load)?
-                .ok_or(InvokeError::NotFound)?
+            let lookup = {
+                let inner = inner.clone();
+                let (t, f) = (tenant.to_owned(), func.to_owned());
+                tokio::task::spawn_blocking(move || inner.components.lookup(&t, &f))
+                    .await
+                    .map_err(|e| {
+                        InvokeError::Load(Error::Internal(format!("resolve task failed: {e}")))
+                    })?
+                    .map_err(InvokeError::Load)?
+            };
+            match lookup {
+                Lookup::NotFound => return Err(InvokeError::NotFound),
+                Lookup::Hit(pre) => pre,
+                Lookup::Miss(digest) => {
+                    // Take the compile permit here, asynchronously, and move
+                    // it into the blocking task: a blocking thread must never
+                    // wait for a permit, or a burst of misses could park the
+                    // whole blocking pool while the permit holders (stages)
+                    // wait for a thread.
+                    let permit =
+                        inner
+                            .compile_slots
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| {
+                                InvokeError::Load(Error::Internal(
+                                    "compile semaphore closed".into(),
+                                ))
+                            })?;
+                    let inner = inner.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        inner.components.get_or_load(&digest)
+                    })
+                    .await
+                    .map_err(|e| {
+                        InvokeError::Load(Error::Internal(format!("load task failed: {e}")))
+                    })?
+                    .map_err(InvokeError::Load)?
+                }
+            }
         };
 
         let ctx = HostCtx::new(
