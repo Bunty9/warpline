@@ -100,7 +100,9 @@ fn decide(input: &Input) -> Decision {
     kv::put(&key, this_order.to_string().as_bytes());
 
     let discount_cents = if this_order >= LOYALTY_FROM_ORDER {
-        input.subtotal_cents * LOYALTY_PERCENT / 100
+        // u128 so the multiplication cannot wrap; the result is at most the
+        // subtotal, so it always fits back into u64.
+        (u128::from(input.subtotal_cents) * u128::from(LOYALTY_PERCENT) / 100) as u64
     } else {
         0
     };

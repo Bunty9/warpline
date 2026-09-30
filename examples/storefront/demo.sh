@@ -92,7 +92,7 @@ echo "    risky-bob -> $(field "$BODY" 'd["message"]')"
 
 step "6. uploading invalid wasm is rejected"
 req PUT "/merchant/$SHOP/hook" -H "authorization: Bearer $KEY" --data-binary "this is not wasm"
-[[ $STATUS == 4?? ]] || fail "invalid wasm: expected 4xx, got $STATUS: $BODY"
+expect_status 422 "invalid wasm"
 echo "    HTTP $STATUS"
 
 step "7. usage summary for $SHOP (metering is batched, so poll briefly)"

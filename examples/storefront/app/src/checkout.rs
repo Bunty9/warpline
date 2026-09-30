@@ -13,6 +13,10 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_MESSAGE_CHARS: usize = 200;
 
 const MAX_ITEMS: usize = 100;
+/// Upper bound (10^12 cents) for any unit price and for the order total.
+/// Keeps every amount an exact JSON number in JavaScript clients and keeps
+/// the arithmetic inside hooks far from overflow.
+pub const MAX_CENTS: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Item {
@@ -46,11 +50,17 @@ impl Order {
             if item.qty == 0 {
                 return Err("qty must be at least 1");
             }
+            if item.unit_cents > MAX_CENTS {
+                return Err("unit_cents is too large");
+            }
             let line = item
                 .unit_cents
                 .checked_mul(u64::from(item.qty))
-                .ok_or("order total overflows")?;
-            total = total.checked_add(line).ok_or("order total overflows")?;
+                .ok_or("order total is too large")?;
+            total = total.checked_add(line).ok_or("order total is too large")?;
+            if total > MAX_CENTS {
+                return Err("order total is too large");
+            }
         }
         Ok(total)
     }
@@ -169,6 +179,15 @@ mod tests {
         assert!(order(vec![]).subtotal().is_err());
         assert!(order(vec![item(0, 1)]).subtotal().is_err());
         assert!(order(vec![item(2, u64::MAX)]).subtotal().is_err());
+        assert_eq!(order(vec![item(1, MAX_CENTS)]).subtotal(), Ok(MAX_CENTS));
+        assert!(order(vec![item(1, MAX_CENTS + 1)]).subtotal().is_err());
+        assert!(
+            order(vec![item(2, MAX_CENTS)]).subtotal().is_err(),
+            "total cap"
+        );
+        assert!(order(vec![item(1, MAX_CENTS), item(1, 1)])
+            .subtotal()
+            .is_err());
         let mut o = order(vec![item(1, 1)]);
         o.customer.clear();
         assert!(o.subtotal().is_err());

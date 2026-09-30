@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+async-trait = "0.1"
+# Same sqlx warpline-core uses; only needed for the app's own PgKv.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

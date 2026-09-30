@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .context("connecting to postgres")?;
     pg::migrate(&pool).await.context("migrating")?;
 
-    let (runtime, meter) = build_runtime(&modules_dir, &pool)?;
+    let (runtime, meter) = build_runtime(&modules_dir, &pool).await?;
     let app = router(AppState::new(runtime, pool, &admin_token, &fraud_api));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

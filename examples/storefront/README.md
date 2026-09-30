@@ -25,16 +25,23 @@ docker compose down -v  # when done
 ```
 
 Storefront is on `localhost:3000`, the fraud mock on `localhost:3100`.
-Without Docker, start Postgres, then:
+Prerequisites: Docker (with compose) for `--up`, `curl` and `python3` (the demo
+uses it to check JSON fields; there is no `jq` dependency).
+
+Without Docker, start a Postgres, then run each command from the directory
+shown:
 
 ```sh
+# in examples/storefront/app/  (two terminals)
 export DATABASE_URL=postgres://... ADMIN_TOKEN=demo-admin-token FRAUD_API=http://127.0.0.1:3100
-cargo run --bin fraud-mock &
-cargo run --bin storefront            # in app/
+cargo run --bin fraud-mock
+cargo run --bin storefront
+
+# in examples/storefront/
 FRAUD_HOST=127.0.0.1 ./demo.sh
 ```
 
-Tests: `cd app && WARPLINE_TEST_DATABASE_URL=postgres://... cargo test`
+Tests, from `examples/storefront/app/`: `WARPLINE_TEST_DATABASE_URL=postgres://... cargo test`
 (the DB test is skipped when the variable is unset). Rebuilding the hook
 needs the `wasm32-wasip2` target; `./build.sh` uses the toolchain pinned in
 `examples/rust-toolchain.toml` so the committed fixture stays reproducible.
@@ -63,6 +70,10 @@ Each `[warpline N]` marker in the code matches a section here.
 checkout: **delete that whole block** when you copy. The hook crate reads
 `warpline.wit` from the repo by relative path; when you copy, vendor that one
 file (say into `hook/wit/`) and point `wit_bindgen::generate!`'s `path` at it.
+The `Dockerfile` and `docker-compose.yml` use the repo root as build context
+only because of that patch. After copying, set the compose `context` to `.`
+(your project root) and drop the `COPY Cargo.toml Cargo.lock`/`COPY crates`
+lines, which only exist to provide the path-patched sources.
 
 **1. The runtime** ([`app/src/lib.rs`](app/src/lib.rs), `build_runtime`). One
 `Runtime` per process, cheap to clone. Config lives in `RuntimeConfig`; the
@@ -70,9 +81,8 @@ library reads no environment variables, so [`main.rs`](app/src/main.rs) is
 where env becomes config. `allow_private_egress = true` is set here only
 because the fraud mock is on localhost or a compose service name.
 **Production keeps it `false`** (the default) and allowlists public hosts, so a
-merchant hook cannot reach your internal network. Guest `kv` uses the default
-in-memory store, so loyalty counters reset on restart; implement `KvStore` for
-durable ones.
+merchant hook cannot reach your internal network. Guest `kv` is backed by Postgres
+(section 10), so loyalty counters survive restarts.
 
 **2. Postgres** (`main.rs`). You create the pool and call `pg::migrate`
 yourself. Everything warpline stores lives in a `warpline` schema, so it can
@@ -123,6 +133,17 @@ so the newest invocations show up a moment later.
 **9. Shutdown** (`main.rs`). After the server stops taking requests,
 `meter.shutdown(timeout)` flushes queued rows. Skip it and the last
 invocations are lost.
+
+**10. Plugging in your own KV store** ([`app/src/kv.rs`](app/src/kv.rs)).
+Guests' `kv` capability is the `KvStore` trait: `get(tenant, key)` and
+`put(tenant, key, value)`, with the tenant passed on every call so tenants
+cannot collide. `PgKv` implements it over an app-owned table
+`storefront.hook_kv` (created by the app, not by warpline's migrations) and
+passes it with `Runtime::builder(cfg).kv(...)`. It enforces the same
+per-tenant quota as the in-memory `MemKv` (key + value + 64 bytes per entry,
+overwrites free the old entry first); exceeding it, or any database error,
+traps the guest, which the policy in section 7 turns into a fail-open
+checkout. Without `.kv(...)` you get `MemKv`, which loses data on restart.
 
 ## The hook
 

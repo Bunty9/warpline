@@ -5,12 +5,14 @@
 
 pub mod checkout;
 pub mod fraud;
+pub mod kv;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::body::Bytes;
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -20,12 +22,16 @@ use serde_json::json;
 use warpline_core::pg::{
     self, AdminError, AuthOutcome, Authenticator, PgMeter, PgMeterHandle, PgPool,
 };
-use warpline_core::{digest, Bytes, Limits, PublishError, Runtime, RuntimeConfig};
+use warpline_core::{digest, Limits, PublishError, Runtime, RuntimeConfig};
 
 use checkout::{HookInput, Order, Verdict, HOOK_FN};
+use kv::PgKv;
 
 /// A merchant hook is a compiled component; this is generous for one.
 const MAX_HOOK_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// Per-merchant budget for the hook's `kv` data.
+const KV_QUOTA_BYTES: usize = 1024 * 1024;
 
 /// [warpline 1] Build the runtime: the object the whole app shares.
 ///
@@ -36,21 +42,27 @@ const MAX_HOOK_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 ///   `127.0.0.1` or a docker-compose name. **Production keeps the default
 ///   `false`** and allowlists public hosts, so a merchant's hook cannot
 ///   probe your internal network.
+/// - `max_output_bytes` is the same limit `checkout::parse_decision`
+///   vets, so there is one number to reason about.
+/// - `.kv(...)` backs guests' `kv` with Postgres ([`PgKv`], see
+///   [warpline 10]); without it the default in-memory store loses data on
+///   restart.
 /// - `PgMeter` records every invocation that reached a guest into
 ///   `warpline.meter` without blocking the request; the returned handle
 ///   must be shut down to flush it (see `main.rs`).
-/// - No `.kv(...)`: guests' `kv` is the default in-memory store, so loyalty
-///   counters reset when the app restarts. Implement `KvStore` over your own
-///   database to make them durable.
-pub fn build_runtime(
+pub async fn build_runtime(
     modules_dir: impl Into<PathBuf>,
     pool: &PgPool,
-) -> Result<(Runtime, PgMeterHandle), warpline_core::Error> {
+) -> anyhow::Result<(Runtime, PgMeterHandle)> {
+    PgKv::migrate(pool).await?;
     let mut cfg = RuntimeConfig::new(modules_dir);
     cfg.allow_private_egress = true;
-    cfg.max_output_bytes = 1024 * 1024; // hooks return small JSON; also vetted at 64 KiB
+    cfg.max_output_bytes = checkout::MAX_OUTPUT_BYTES;
     let (meter, meter_handle) = PgMeter::spawn(pool.clone(), 1024);
-    let runtime = Runtime::builder(cfg).meter(Arc::new(meter)).build()?;
+    let runtime = Runtime::builder(cfg)
+        .kv(Arc::new(PgKv::new(pool.clone(), KV_QUOTA_BYTES)))
+        .meter(Arc::new(meter))
+        .build()?;
     Ok((runtime, meter_handle))
 }
 
@@ -85,10 +97,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/admin/merchants", post(create_merchant))
-        .route(
-            "/merchant/{name}/hook",
-            put(upload_hook).layer(DefaultBodyLimit::max(MAX_HOOK_UPLOAD_BYTES)),
-        )
+        .route("/merchant/{name}/hook", put(upload_hook))
         .route("/merchant/{name}/usage", get(usage))
         .route("/shops/{merchant}/checkout", post(checkout))
         .with_state(state)
@@ -96,6 +105,17 @@ pub fn router(state: AppState) -> Router {
 
 fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
+}
+
+/// Read a request body only after the caller has been authenticated: taking
+/// `Bytes`/`Json` as an extractor would buffer and parse it first.
+async fn read_body(
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<Bytes, (StatusCode, &'static str)> {
+    axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -139,15 +159,21 @@ struct NewMerchant {
 
 /// `POST /admin/merchants`: create a merchant and return its API key (shown
 /// once; only a hash is stored).
-async fn create_merchant(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<NewMerchant>,
-) -> Response {
-    let presented = bearer(&headers).map(|t| digest(t.as_bytes()));
+async fn create_merchant(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let presented = bearer(&parts.headers).map(|t| digest(t.as_bytes()));
     if presented.as_deref() != Some(&*state.admin_token_digest) {
         return error(StatusCode::UNAUTHORIZED, "bad admin token");
     }
+    // Auth first, then the body.
+    let bytes = match read_body(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err((status, msg)) => return error(status, msg),
+    };
+    let req: NewMerchant = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
 
     // [warpline 3] A tenant is a row with limits; the key is issued in the
     // same transaction. Start from the defaults and override what was sent;
@@ -186,12 +212,17 @@ async fn create_merchant(
 async fn upload_hook(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Response {
-    if let Err((status, msg)) = authorize(&state, &name, &headers).await {
+    let (parts, body) = request.into_parts();
+    if let Err((status, msg)) = authorize(&state, &name, &parts.headers).await {
         return error(status, msg);
     }
+    // Only an authenticated merchant gets its upload read (and bounded).
+    let body = match read_body(body, MAX_HOOK_UPLOAD_BYTES).await {
+        Ok(b) => b,
+        Err((status, msg)) => return error(status, msg),
+    };
     // [warpline 5] Compile, check it fits the `handler` world, persist, and
     // atomically point (merchant, "checkout") at it. Bad uploads are the
     // client's fault (422); nothing is activated on failure.

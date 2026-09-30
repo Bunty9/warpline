@@ -6,9 +6,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use storefront::kv::PgKv;
 use storefront::{build_runtime, fraud, router, AppState};
 use tower::ServiceExt;
-use warpline_core::pg;
+use warpline_core::{pg, KvError, KvStore};
 
 const HOOK: &[u8] = include_bytes!("fixtures/checkout_hook.wasm");
 const ADMIN: &str = "test-admin-token";
@@ -93,15 +94,19 @@ impl Client {
     }
 }
 
+fn db_url() -> Option<String> {
+    let url = std::env::var("WARPLINE_TEST_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.is_empty());
+    if url.is_none() {
+        eprintln!("skipping: WARPLINE_TEST_DATABASE_URL not set");
+    }
+    url
+}
+
 #[tokio::test]
 async fn storefront_flow() {
-    let url = match std::env::var("WARPLINE_TEST_DATABASE_URL") {
-        Ok(u) if !u.is_empty() => u,
-        _ => {
-            eprintln!("skipping: WARPLINE_TEST_DATABASE_URL not set");
-            return;
-        }
-    };
+    let Some(url) = db_url() else { return };
 
     // Fraud mock in-process on a free port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -111,7 +116,7 @@ async fn storefront_flow() {
     let pool = pg::connect(&url).await.unwrap();
     pg::migrate(&pool).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, meter) = build_runtime(dir.path(), &pool).unwrap();
+    let (runtime, meter) = build_runtime(dir.path(), &pool).await.unwrap();
     let state = AppState::new(
         runtime,
         pool.clone(),
@@ -227,4 +232,42 @@ async fn storefront_flow() {
 
     // Shutdown drains the meter.
     meter.shutdown(std::time::Duration::from_secs(5)).await;
+
+    // "Restart": a second runtime and router over the same database and
+    // module registry. The loyalty counter lives in Postgres (PgKv), so
+    // alice's 4th order still gets the discount.
+    let (runtime2, meter2) = build_runtime(dir.path(), &pool).await.unwrap();
+    let app2 = Client(router(AppState::new(
+        runtime2,
+        pool.clone(),
+        ADMIN,
+        &format!("http://{fraud_addr}"),
+    )));
+    let (st, v) = app2.checkout(&m1, "alice").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["discount_cents"], 200,
+        "counter should survive a restart: {v}"
+    );
+    meter2.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn pg_kv_quota_and_overwrite() {
+    let Some(url) = db_url() else { return };
+    let pool = pg::connect(&url).await.unwrap();
+    PgKv::migrate(&pool).await.unwrap();
+    let tenant = format!(
+        "kvq-{}",
+        &warpline_core::digest(format!("{:?}", std::time::SystemTime::now()).as_bytes())[..10]
+    );
+    // Room for exactly one entry with a 2-byte key and 10-byte value.
+    let kv = PgKv::new(pool, 64 + 12);
+    kv.put(&tenant, "k1", vec![0; 10]).await.unwrap();
+    // Overwriting the same key frees the old entry first.
+    kv.put(&tenant, "k1", vec![1; 10]).await.unwrap();
+    assert_eq!(kv.get(&tenant, "k1").await.unwrap(), Some(vec![1; 10]));
+    let err = kv.put(&tenant, "k2", vec![0; 10]).await.unwrap_err();
+    assert!(matches!(err, KvError::QuotaExceeded { .. }), "{err:?}");
+    assert_eq!(kv.get(&tenant, "k2").await.unwrap(), None);
 }
