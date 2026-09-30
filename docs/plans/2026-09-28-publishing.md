@@ -74,8 +74,9 @@ cargo publish --workspace        # or, in order: warpline-core, warpline-control
 
 Then tag and release without re-running the publish: create the tag on
 GitHub with `gh release create vX.Y.Z --notes-file <changelog section>`
-after the crates are out. (Pushing the tag also triggers the workflow, whose
-publish step then fails harmlessly on the already-published version.)
+after the crates are out. (Pushing the tag also triggers the workflow: it skips crates already on
+crates.io and skips the GitHub release if one exists, so a re-run over a
+manual publish is a no-op.)
 
 ## Open decisions
 
