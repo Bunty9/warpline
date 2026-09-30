@@ -1,0 +1,23 @@
+[package]
+name = "checkout-hook"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Example merchant checkout hook for the warpline storefront example (loyalty discount + fraud check)."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Guest builds must be reproducible (build.sh checks the fixture hash), so
+# keep the same release profile as the repo's other guests.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

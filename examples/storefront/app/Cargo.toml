@@ -1,0 +1,45 @@
+[package]
+name = "storefront"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Reference example: embedding warpline-core in an axum app (merchant checkout hooks)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "storefront"
+path = "src/main.rs"
+
+[[bin]]
+name = "fraud-mock"
+path = "src/bin/fraud-mock.rs"
+
+[dependencies]
+# What you add to your own app. Nothing else from warpline is needed:
+# `warpline_core::pg` (feature `postgres`, on by default) brings sqlx along.
+warpline-core = "0.2"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+# ---------------------------------------------------------------------------
+# COPIERS: DELETE THIS WHOLE SECTION. It is the only thing tying the example
+# to this repository: it makes `warpline-core = "0.2"` above resolve to the
+# checkout next to it instead of crates.io. In your own app you just depend on
+# the published crate.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+warpline-core = { path = "../../../crates/core" }

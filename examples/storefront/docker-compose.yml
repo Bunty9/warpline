@@ -1,0 +1,54 @@
+# postgres + fraud-mock + storefront. Host ports: storefront 3000, fraud-mock
+# 3100 (Postgres is not published). Run from this directory:
+#   docker compose up -d --build     (or: ./demo.sh --up)
+name: warpline-storefront
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: storefront
+      POSTGRES_PASSWORD: storefront
+      POSTGRES_DB: storefront
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storefront -d storefront"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  fraud-mock:
+    image: warpline-storefront-fraud-mock
+    build:
+      # Repo root: the app's [patch.crates-io] points at ../../../crates/core.
+      context: ../..
+      dockerfile: examples/storefront/Dockerfile
+      target: fraud-mock
+    ports:
+      - "3100:3100"
+
+  storefront:
+    image: warpline-storefront-app
+    build:
+      context: ../..
+      dockerfile: examples/storefront/Dockerfile
+      target: storefront
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fraud-mock:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://storefront:storefront@postgres:5432/storefront
+      # Demo value only; use a real secret outside local demos.
+      ADMIN_TOKEN: demo-admin-token
+      # The hook is handed this URL; the merchant's allowed_hosts must
+      # contain its host name ("fraud-mock").
+      FRAUD_API: http://fraud-mock:3100
+      RUST_LOG: info
+    ports:
+      - "3000:3000"
+    volumes:
+      - modules:/var/lib/storefront/modules
+
+volumes:
+  modules:

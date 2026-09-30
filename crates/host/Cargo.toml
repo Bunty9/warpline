@@ -26,8 +26,8 @@ default = ["embed-control"]
 embed-control = ["dep:warpline-control"]
 
 [dependencies]
-warpline-control = { path = "../control", version = "0.1.0", optional = true }
-warpline-core = { path = "../core", version = "0.1.0" }
+warpline-control = { path = "../control", version = "0.2.0", optional = true }
+warpline-core = { path = "../core", version = "0.2.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
@@ -43,4 +43,4 @@ sqlx = { workspace = true }
 serde_json = { workspace = true }
 # Dev-mode end-to-end tests upload through the real control-plane router
 # into a shared tempdir modules dir, then invoke through this crate's.
-warpline-control = { path = "../control", version = "0.1.0" }
+warpline-control = { path = "../control", version = "0.2.0" }
