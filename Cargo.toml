@@ -36,7 +36,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Postgres for tenant + metering tables.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "migrate"] }
 
 # WASM runtime. `default-features = false` because upstream defaults now pull
 # in gc/pooling-allocator/wit-parser/wat/cache/etc that this host never uses;
