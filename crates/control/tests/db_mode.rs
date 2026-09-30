@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use warpline_control::{router, AppState};
 use warpline_core::pg::{self, Authenticator};
-use warpline_core::runtime::{build_engine, build_linker};
+use warpline_core::{Runtime, RuntimeConfig};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -47,10 +47,9 @@ macro_rules! require_test_db {
 }
 
 async fn state(db: Authenticator, admin_token: Option<&str>) -> (AppState, tempfile::TempDir) {
-    let engine = build_engine().expect("build engine");
-    let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut state = AppState::new(engine, linker, dir.path().to_path_buf(), Some(db));
+    let runtime = Runtime::new(RuntimeConfig::new(dir.path())).expect("build runtime");
+    let mut state = AppState::new(runtime, Some(db));
     state.admin_token = admin_token.map(str::to_string);
     (state, dir)
 }

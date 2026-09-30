@@ -1,15 +1,13 @@
 //! `warpline-control` — control plane HTTP API.
 //!
 //! - `POST /tenants/{tenant}/functions/{func}` accepts a multipart `.wasm`
-//!   upload (field `wasm`/`module`/`file`), compiles it (`spawn_blocking`,
-//!   under a process-wide semaphore — compilation is CPU-heavy and
-//!   otherwise unbounded concurrency here is a DoS vector), type-checks its
-//!   imports/exports against the linker
-//!   (`warpline_core::runtime::typecheck_component`) so a bad component is
-//!   rejected here rather than at invoke time, and only *then* persists the
-//!   source `.wasm` + compiled `.cwasm` and publishes the `(tenant, func)`
-//!   pointer — in DB mode, inside one transaction that also enforces the
-//!   per-tenant function quota (see `publish_pointer`).
+//!   upload (field `wasm`/`module`/`file`) and stages it through
+//!   `warpline_core::Runtime::stage` (compile under the runtime's compile
+//!   semaphore, type-check against the handler world, persist), so a bad
+//!   component is rejected here rather than at invoke time. Only then is
+//!   the `(tenant, func)` pointer activated — in DB mode after a
+//!   transaction that also enforces the per-tenant function quota (see
+//!   `publish_pointer`).
 //! - `POST /admin/tenants/{tenant}` (guarded by the admin token) creates a
 //!   tenant idempotently, optionally sets its resource limits, and issues a
 //!   new API key via `warpline_core::pg::create_tenant` (one transaction).
@@ -21,9 +19,6 @@
 //! `crates/control/tests/` can drive the whole app through
 //! `tower::ServiceExt::oneshot` without a real listening socket.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -32,17 +27,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tokio::sync::Semaphore;
-use wasmtime::component::{Component, Linker};
-use wasmtime::Engine;
-
 use warpline_core::{
-    cache,
     pg::{self, AdminError, AuthOutcome, Authenticator},
-    registry,
-    runtime::typecheck_component,
-    types::{parse_bearer, valid_name, validate_cpu_budget_ms, validate_mem_cap_bytes, HostCtx},
-    Limits,
+    types::{parse_bearer, valid_name, validate_cpu_budget_ms, validate_mem_cap_bytes},
+    Limits, PublishError, Runtime, Staged,
 };
 
 /// Multipart upload size cap.
@@ -55,21 +43,16 @@ const UPLOAD_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// without uploading 100 real functions.
 const DEFAULT_MAX_FUNCTIONS_PER_TENANT: i64 = 100;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState {
-    pub engine: Engine,
-    pub linker: Linker<HostCtx>,
-    pub modules_dir: PathBuf,
+    /// Stages and activates uploaded modules.
+    pub runtime: Runtime,
     /// `None` = dev mode without Postgres: no auth, default limits, no admin
     /// API. The pool is reached through [`Authenticator::pool`].
     pub auth: Option<Authenticator>,
     /// Admin bearer token, or `None` — the admin route is disabled (404) in
     /// that case. Set by the binary (from `WARPLINE_ADMIN_TOKEN`).
     pub admin_token: Option<String>,
-    /// Bounds concurrent `spawn_blocking` compiles process-wide (finding
-    /// 2) — a burst of uploads shouldn't be able to spin up an unbounded
-    /// number of full cranelift passes at once.
-    pub compile_semaphore: Arc<Semaphore>,
     /// Per-tenant cap on distinct function names, see
     /// `DEFAULT_MAX_FUNCTIONS_PER_TENANT`. A field (not that constant
     /// directly) so tests can dial it down and exercise the quota boundary
@@ -78,24 +61,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        engine: Engine,
-        linker: Linker<HostCtx>,
-        modules_dir: PathBuf,
-        auth: Option<Authenticator>,
-    ) -> Self {
-        let permits = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            / 2)
-        .max(1);
+    pub fn new(runtime: Runtime, auth: Option<Authenticator>) -> Self {
         Self {
-            engine,
-            linker,
-            modules_dir,
+            runtime,
             auth,
             admin_token: None,
-            compile_semaphore: Arc::new(Semaphore::new(permits)),
             max_functions_per_tenant: DEFAULT_MAX_FUNCTIONS_PER_TENANT,
         }
     }
@@ -174,29 +144,12 @@ async fn upload(
         return (StatusCode::BAD_REQUEST, "missing wasm field".to_string()).into_response();
     };
 
-    // Bound concurrent compiles process-wide (finding 2): held across the
-    // whole `spawn_blocking` call below, not just while acquiring it.
-    let Ok(permit) = state.compile_semaphore.clone().acquire_owned().await else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        )
-            .into_response();
-    };
-
-    let cwasm_dir = registry::cwasm_dir(&state.modules_dir);
-    let engine = state.engine.clone();
-    let wasm_for_compile = wasm.clone();
-    let compiled = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        cache::compile(&engine, &wasm_for_compile, &cwasm_dir)
-    })
-    .await;
-    let (component, wasm_digest): (Component, String) = match compiled {
-        // The freshness bool isn't needed here — the component always gets
-        // persisted below, unconditionally, once it's passed the typecheck.
-        Ok(Ok((component, digest, _freshly_compiled))) => (component, digest),
-        Ok(Err(e)) => {
+    // Compile (bounded by the runtime's compile semaphore), typecheck and
+    // persist. A component that fails either check never leaves a blob
+    // behind for the GC pass to clean up.
+    let staged = match state.runtime.stage(wasm).await {
+        Ok(staged) => staged,
+        Err(PublishError::Compile(e)) => {
             tracing::warn!(%tenant, %func, error = %e, "component compile/parse failed");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -204,44 +157,17 @@ async fn upload(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(%tenant, %func, error = %e, "compile task panicked");
+        Err(PublishError::ImportMismatch(e)) => {
+            tracing::warn!(%tenant, %func, error = %e, "component failed import/export typecheck");
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "component does not match the warpline handler world (missing export or \
+                 unsatisfiable import)"
+                    .to_string(),
             )
                 .into_response();
         }
-    };
-
-    if let Err(e) = typecheck_component(&state.linker, &component) {
-        tracing::warn!(%tenant, %func, error = %e, "component failed import/export typecheck");
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "component does not match the warpline handler world (missing export or \
-             unsatisfiable import)"
-                .to_string(),
-        )
-            .into_response();
-    }
-
-    // Only a typechecked component's bytes get persisted (finding 3): an
-    // upload that compiles but fails the typecheck never leaves a
-    // wasm/cwasm blob behind for the GC pass to have to clean up later.
-    let cwasm_dir = registry::cwasm_dir(&state.modules_dir);
-    let modules_dir = state.modules_dir.clone();
-    let engine = state.engine.clone();
-    let wasm_for_persist = wasm.clone();
-    let digest_for_persist = wasm_digest.clone();
-    let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        cache::persist_cwasm(&component, &engine, &cwasm_dir, &digest_for_persist)?;
-        registry::write_wasm_source(&modules_dir, &digest_for_persist, &wasm_for_persist)?;
-        Ok(())
-    })
-    .await;
-    match persisted {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::error!(%tenant, %func, error = %e, "failed to persist compiled module");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -249,17 +175,10 @@ async fn upload(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(%tenant, %func, error = %e, "persist task panicked");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
-            )
-                .into_response();
-        }
-    }
+    };
+    let wasm_digest = staged.digest.clone();
 
-    if let Err((status, msg)) = publish_pointer(&state, &tenant, &func, &wasm_digest).await {
+    if let Err((status, msg)) = publish_pointer(&state, &tenant, &func, &staged).await {
         return (status, msg).into_response();
     }
 
@@ -307,18 +226,23 @@ async fn publish_pointer(
     state: &AppState,
     tenant: &str,
     func: &str,
-    wasm_digest: &str,
+    staged: &Staged,
 ) -> Result<(), (StatusCode, String)> {
-    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
-        return registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(
-            |e| {
+    let activate = || async {
+        state
+            .runtime
+            .activate(tenant, func, staged)
+            .await
+            .map_err(|e| {
                 tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "failed to publish module".to_string(),
                 )
-            },
-        );
+            })
+    };
+    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
+        return activate().await;
     };
 
     let internal_error = |e: sqlx::Error, action: &str| {
@@ -376,7 +300,7 @@ async fn publish_pointer(
     )
     .bind(tenant_id)
     .bind(func)
-    .bind(wasm_digest)
+    .bind(&staged.digest)
     .execute(&mut *tx)
     .await
     .map_err(|e| internal_error(e, "failed to upsert functions row"))?;
@@ -388,15 +312,7 @@ async fn publish_pointer(
     // Written after the commit, not before (finding 6) — see doc comment
     // above for why that ordering is the one that can't leave a pointer
     // serving code the `functions` table doesn't know about.
-    registry::write_pointer(&state.modules_dir, tenant, func, wasm_digest).map_err(|e| {
-        tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to publish module".to_string(),
-        )
-    })?;
-
-    Ok(())
+    activate().await
 }
 
 /// `POST /admin/tenants/{tenant}` request body — every field optional, so a

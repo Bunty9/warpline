@@ -29,32 +29,26 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lru::LruCache;
-use wasmtime::component::Linker;
+use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
 use crate::cache;
-use crate::runtime::HandlerPre;
+use crate::sandbox::HandlerPre;
 use crate::types::{valid_name, HostCtx};
-
-/// Cap on the in-memory [`ComponentCache`] entry count — see
-/// [`ComponentCache::new`].
-pub const COMPONENT_CACHE_CAP: usize = 256;
-/// Cap on the in-memory [`ComponentCache`]'s total serialized-cwasm bytes —
-/// see [`ComponentCache::new`].
-pub const COMPONENT_CACHE_BYTE_BUDGET: usize = 512 * 1024 * 1024;
+use crate::Error;
 
 /// The shared, content-addressed `.cwasm` cache dir under `modules_dir` —
 /// what `cache::load_or_compile`/`cache::load_cwasm` read and write.
-pub fn cwasm_dir(modules_dir: &Path) -> PathBuf {
+pub(crate) fn cwasm_dir(modules_dir: &Path) -> PathBuf {
     modules_dir.join("cwasm")
 }
 
 /// The shared, content-addressed source-`.wasm` dir under `modules_dir` —
 /// see module docs.
-pub fn wasm_dir(modules_dir: &Path) -> PathBuf {
+pub(crate) fn wasm_dir(modules_dir: &Path) -> PathBuf {
     modules_dir.join("wasm")
 }
 
@@ -73,38 +67,53 @@ fn pointer_path(modules_dir: &Path, tenant: &str, func: &str) -> Option<PathBuf>
 /// resolves to `digest`. Same tempfile-in-same-dir-then-rename pattern as
 /// `cache`'s writes, for the same reason: a reader (`read_pointer`) never
 /// observes a partial write.
-pub fn write_pointer(
+pub(crate) fn write_pointer(
     modules_dir: &Path,
     tenant: &str,
     func: &str,
     digest: &str,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        cache::is_valid_digest(digest),
-        "invalid digest: expected 64 lowercase hex characters"
-    );
+) -> Result<(), Error> {
+    if !cache::is_valid_digest(digest) {
+        return Err(Error::Corrupt(
+            "invalid digest: expected 64 lowercase hex characters".into(),
+        ));
+    }
     let path = pointer_path(modules_dir, tenant, func)
-        .ok_or_else(|| anyhow::anyhow!("invalid tenant or function name"))?;
+        .ok_or_else(|| Error::Corrupt("invalid tenant or function name".into()))?;
     let parent = path.parent().expect("pointer_path always has a parent");
     cache::atomic_write(parent, &path, digest.as_bytes())
 }
 
+/// Set `path`'s mtime to now. Errors (including `NotFound`) are returned.
+pub(crate) fn touch(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(SystemTime::now())
+}
+
 /// Atomically persist the uploaded source `.wasm` bytes for `digest` under
-/// `modules_dir/wasm/` — see module docs. A no-op if the content-addressed
-/// file already exists (re-upload of identical bytes, or two tenants
-/// uploading the same module).
-pub fn write_wasm_source(
+/// `modules_dir/wasm/` — see module docs. If the content-addressed file
+/// already exists (re-upload of identical bytes, or two tenants uploading
+/// the same module) it is left alone but its mtime is bumped, so a GC pass
+/// racing this upload sees it as fresh and leaves it for the pointer that is
+/// about to reference it.
+pub(crate) fn write_wasm_source(
     modules_dir: &Path,
     digest: &str,
     wasm_bytes: &[u8],
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        cache::is_valid_digest(digest),
-        "invalid digest: expected 64 lowercase hex characters"
-    );
+) -> Result<(), Error> {
+    if !cache::is_valid_digest(digest) {
+        return Err(Error::Corrupt(
+            "invalid digest: expected 64 lowercase hex characters".into(),
+        ));
+    }
     let dest = wasm_path(modules_dir, digest);
-    if dest.exists() {
-        return Ok(());
+    match touch(&dest) {
+        Ok(()) => return Ok(()),
+        // Absent (or collected between the check and the write): write it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     cache::atomic_write(&wasm_dir(modules_dir), &dest, wasm_bytes)
 }
@@ -116,11 +125,11 @@ pub fn write_wasm_source(
 /// (only `write_pointer` writes it), but the digest still ends up in a
 /// cache-directory path, so the same shape check `cache::load_cwasm` does
 /// applies here too.
-pub fn read_pointer(
+pub(crate) fn read_pointer(
     modules_dir: &Path,
     tenant: &str,
     func: &str,
-) -> anyhow::Result<Option<String>> {
+) -> Result<Option<String>, Error> {
     let Some(path) = pointer_path(modules_dir, tenant, func) else {
         return Ok(None);
     };
@@ -130,11 +139,12 @@ pub fn read_pointer(
         Err(e) => return Err(e.into()),
     };
     let digest = digest.trim();
-    anyhow::ensure!(
-        cache::is_valid_digest(digest),
-        "corrupt pointer file {}: not a valid digest",
-        path.display()
-    );
+    if !cache::is_valid_digest(digest) {
+        return Err(Error::Corrupt(format!(
+            "corrupt pointer file {}: not a valid digest",
+            path.display()
+        )));
+    }
     Ok(Some(digest.to_string()))
 }
 
@@ -152,34 +162,39 @@ struct ComponentCacheInner {
     total_bytes: usize,
 }
 
-/// In-memory LRU of loaded [`Component`](wasmtime::component::Component)s keyed by content digest, so a
+/// In-memory LRU of pre-instantiated components keyed by content digest, so a
 /// warm invoke (whose pointer resolves to a digest this cache already
 /// holds) skips `Component::deserialize` entirely. A miss falls through to
 /// [`cache::load_cwasm`] against `modules_dir`'s shared `cwasm/` directory,
 /// and (on top of that failing) to recompiling from the shared `wasm/`
 /// source directory — see [`Self::get_or_load`].
 ///
+/// The cache owns the `Engine` and `Linker` it loads with, so a cached entry
+/// can never have been built against a different pair than the one invoking.
+///
 /// Bounded by both entry count and total serialized-cwasm bytes: a handful
 /// of huge components hitting the byte budget evicts before the count cap
 /// would ever be reached, and vice versa for many small ones.
-pub struct ComponentCache {
+pub(crate) struct ComponentCache {
+    engine: Engine,
+    linker: Arc<Linker<HostCtx>>,
+    modules_dir: PathBuf,
     inner: Mutex<ComponentCacheInner>,
     byte_budget: usize,
 }
 
 impl ComponentCache {
-    /// A cache holding up to [`COMPONENT_CACHE_CAP`] components and
-    /// [`COMPONENT_CACHE_BYTE_BUDGET`] total serialized bytes.
-    pub fn new() -> Self {
-        Self::with_capacity(COMPONENT_CACHE_CAP)
-    }
-
-    pub fn with_capacity(cap: usize) -> Self {
-        Self::with_capacity_and_byte_budget(cap, COMPONENT_CACHE_BYTE_BUDGET)
-    }
-
-    pub fn with_capacity_and_byte_budget(cap: usize, byte_budget: usize) -> Self {
+    pub(crate) fn new(
+        engine: Engine,
+        linker: Arc<Linker<HostCtx>>,
+        modules_dir: PathBuf,
+        cap: usize,
+        byte_budget: usize,
+    ) -> Self {
         Self {
+            engine,
+            linker,
+            modules_dir,
             inner: Mutex::new(ComponentCacheInner {
                 lru: LruCache::new(NonZeroUsize::new(cap.max(1)).unwrap()),
                 total_bytes: 0,
@@ -188,31 +203,39 @@ impl ComponentCache {
         }
     }
 
+    /// Blocking: resolve `(tenant, func)` through its pointer file to a
+    /// loaded [`HandlerPre`]; `Ok(None)` if nothing was published there.
+    pub(crate) fn resolve(
+        &self,
+        tenant: &str,
+        func: &str,
+    ) -> Result<Option<Arc<HandlerPre<HostCtx>>>, Error> {
+        let Some(digest) = read_pointer(&self.modules_dir, tenant, func)? else {
+            return Ok(None);
+        };
+        self.get_or_load(&digest).map(Some)
+    }
+
     /// Resolve `digest` to a pre-instantiated [`HandlerPre`], hitting the
     /// LRU first, then the on-disk `.cwasm` cache, then — if that's missing
     /// or fails to deserialize (deleted, corrupt, or invalidated by an
     /// engine/config upgrade — see module docs) — recompiling from the
     /// persisted source `wasm/{digest}.wasm` and re-publishing a fresh
-    /// `.cwasm` for next time. A cache miss additionally pays for
-    /// `linker.instantiate_pre`'s import/export type-check exactly once per
-    /// digest (not per invoke) — see [`crate::runtime::instantiate_pre`].
+    /// `.cwasm` for next time. Failing to re-publish (read-only or full
+    /// disk) is logged and the freshly compiled component is served anyway.
+    /// A cache miss additionally pays for `linker.instantiate_pre`'s
+    /// import/export type-check exactly once per digest (not per invoke).
     ///
     /// Concurrent misses on the same digest each recompile independently.
     // ponytail: no single-flight dedupe on a cold digest — a burst of
     // concurrent first-invokes for one freshly-uploaded function each pay
     // for their own recompile. Add a per-digest in-flight map if that shows
     // up as real load.
-    pub fn get_or_load(
-        &self,
-        engine: &Engine,
-        linker: &Linker<HostCtx>,
-        modules_dir: &Path,
-        digest: &str,
-    ) -> anyhow::Result<Arc<HandlerPre<HostCtx>>> {
+    pub(crate) fn get_or_load(&self, digest: &str) -> Result<Arc<HandlerPre<HostCtx>>, Error> {
         if let Some(hit) = self
             .inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .lru
             .get(digest)
             .map(|e| e.pre.clone())
@@ -220,25 +243,44 @@ impl ComponentCache {
             return Ok(hit);
         }
 
-        let cwasm_dir = cwasm_dir(modules_dir);
-        let component = match cache::load_cwasm(engine, &cwasm_dir, digest) {
-            Ok(c) => c,
+        let cwasm_dir = cwasm_dir(&self.modules_dir);
+        let (component, weight) = match cache::load_cwasm(&self.engine, &cwasm_dir, digest) {
+            Ok(c) => {
+                let weight =
+                    std::fs::metadata(cwasm_dir.join(cache::cache_file_name(&self.engine, digest)))
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
+                (c, weight)
+            }
             Err(e) => {
                 tracing::warn!(
                     digest,
                     error = %e,
                     "cwasm cache miss/corrupt, recompiling from stored source"
                 );
-                let wasm_bytes = std::fs::read(wasm_path(modules_dir, digest)).map_err(|_| {
-                    anyhow::anyhow!("no cwasm and no source wasm on disk for digest {digest}")
-                })?;
-                cache::load_or_compile(engine, &wasm_bytes, &cwasm_dir)?
+                let wasm_bytes =
+                    std::fs::read(wasm_path(&self.modules_dir, digest)).map_err(|_| {
+                        Error::Corrupt(format!(
+                            "no cwasm and no source wasm on disk for digest {digest}"
+                        ))
+                    })?;
+                let component = Component::new(&self.engine, &wasm_bytes)?;
+                let weight =
+                    match cache::persist_cwasm(&component, &self.engine, &cwasm_dir, digest) {
+                        Ok(len) => len,
+                        Err(e) => {
+                            tracing::warn!(
+                                digest,
+                                error = %e,
+                                "could not re-publish recompiled .cwasm; serving from memory"
+                            );
+                            wasm_bytes.len()
+                        }
+                    };
+                (component, weight)
             }
         };
-        let weight = std::fs::metadata(cwasm_dir.join(cache::cache_file_name(engine, digest)))
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
-        let pre = Arc::new(crate::runtime::instantiate_pre(linker, &component)?);
+        let pre = Arc::new(crate::sandbox::instantiate_pre(&self.linker, &component)?);
         self.insert(digest, pre.clone(), weight);
         Ok(pre)
     }
@@ -247,7 +289,7 @@ impl ComponentCache {
     /// least-recently-used entries (by count, via `LruCache::put`, and by
     /// `weight` via `pop_lru`) until back under both caps.
     fn insert(&self, digest: &str, pre: Arc<HandlerPre<HostCtx>>, weight: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(evicted) = inner
             .lru
             .put(digest.to_string(), CacheEntry { pre, weight })
@@ -266,38 +308,7 @@ impl ComponentCache {
     }
 }
 
-impl Default for ComponentCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Resolve `(tenant, func)` to a loaded, pre-instantiated [`HandlerPre`].
-/// The pointer read and (on a cwasm miss) the recompile-from-source
-/// fallback are both blocking filesystem/CPU work, so this runs on a
-/// blocking-pool thread rather than an async worker — see
-/// `warpline-host`'s call site.
-pub async fn resolve(
-    engine: Engine,
-    linker: Linker<HostCtx>,
-    cache: Arc<ComponentCache>,
-    modules_dir: PathBuf,
-    tenant: String,
-    func: String,
-) -> anyhow::Result<Option<Arc<HandlerPre<HostCtx>>>> {
-    tokio::task::spawn_blocking(move || {
-        let Some(digest) = read_pointer(&modules_dir, &tenant, &func)? else {
-            return Ok(None);
-        };
-        cache
-            .get_or_load(&engine, &linker, &modules_dir, &digest)
-            .map(Some)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("resolve task panicked: {e}"))?
-}
-
-/// Default `grace_period` for [`gc_unreferenced_blobs`] — an hour is
+/// Default grace period for [`Runtime::gc`](crate::Runtime::gc) — an hour is
 /// comfortably longer than any single upload's compile-then-persist-then
 /// point window could plausibly take, so nothing an in-flight upload has
 /// touched in the last hour is ever a GC candidate.
@@ -350,37 +361,59 @@ fn sweep_stale_temp_files(dir: &Path, grace_period: Duration) -> usize {
 /// [`GC_GRACE_PERIOD`] in production, `Duration::ZERO` in a test that wants
 /// to observe collection immediately.
 ///
-/// Meant to run once, at control-plane startup before serving, so a crash
+/// Meant to run once, at startup before serving, so a crash
 /// between persisting a blob and writing its pointer (or an old upload that
 /// never made it past typecheck, back when the cwasm was written before
 /// that check) doesn't leak disk forever. Best-effort: a file that can't be
-/// removed is skipped rather than aborting the whole pass. Returns the
-/// number of files removed.
-pub fn gc_unreferenced_blobs(
+/// removed is skipped rather than aborting the whole pass, but a pointer that
+/// cannot be *read* aborts it before anything is deleted. Returns the number
+/// of files removed.
+pub(crate) fn gc_unreferenced_blobs(
     modules_dir: &Path,
     engine: &Engine,
     grace_period: Duration,
-) -> anyhow::Result<usize> {
+) -> Result<usize, Error> {
+    // Pass 1: learn every referenced digest, deleting nothing. A pointer we
+    // cannot read might reference any blob, so *any* read error other than
+    // `NotFound` (a vanished entry) aborts the pass before the first delete;
+    // treating "unreadable" as "unreferenced" would collect live modules.
     let mut referenced: HashSet<String> = HashSet::new();
-    let mut removed = 0usize;
+    let mut tenant_dirs: Vec<PathBuf> = Vec::new();
     let tenants_dir = modules_dir.join("tenants");
-    if tenants_dir.exists() {
-        for tenant_entry in std::fs::read_dir(&tenants_dir)? {
-            let tenant_entry = tenant_entry?;
-            if !tenant_entry.file_type()?.is_dir() {
-                continue;
-            }
-            removed += sweep_stale_temp_files(&tenant_entry.path(), grace_period);
-            for func_entry in std::fs::read_dir(tenant_entry.path())? {
-                let func_entry = func_entry?;
-                if let Ok(digest) = std::fs::read_to_string(func_entry.path()) {
-                    let digest = digest.trim();
+    match std::fs::read_dir(&tenants_dir) {
+        Ok(tenants) => {
+            for tenant_entry in tenants {
+                let tenant_entry = tenant_entry?;
+                if !tenant_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                for func_entry in std::fs::read_dir(tenant_entry.path())? {
+                    let func_entry = func_entry?;
+                    // In-flight `atomic_write` temp files are not pointers.
+                    if func_entry.file_name().to_string_lossy().starts_with(".tmp") {
+                        continue;
+                    }
+                    let contents = match std::fs::read_to_string(func_entry.path()) {
+                        Ok(c) => c,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let digest = contents.trim();
                     if cache::is_valid_digest(digest) {
                         referenced.insert(digest.to_string());
                     }
                 }
+                tenant_dirs.push(tenant_entry.path());
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Pass 2: delete.
+    let mut removed = 0usize;
+    for dir in &tenant_dirs {
+        removed += sweep_stale_temp_files(dir, grace_period);
     }
 
     let wdir = wasm_dir(modules_dir);
@@ -434,12 +467,17 @@ impl std::fmt::Debug for ComponentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{build_engine, build_linker};
+    use crate::sandbox::{build_engine, build_linker};
 
     const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/test_guest.wasm"
     ));
+
+    fn test_cache(engine: &Engine, dir: &Path) -> ComponentCache {
+        let linker = Arc::new(build_linker(engine).unwrap());
+        ComponentCache::new(engine.clone(), linker, dir.to_path_buf(), 256, usize::MAX)
+    }
 
     #[test]
     fn write_then_read_pointer_roundtrips() {
@@ -490,8 +528,8 @@ mod tests {
     #[test]
     fn get_or_load_recompiles_from_source_after_cwasm_deleted() {
         let engine = build_engine().unwrap();
-        let linker = build_linker(&engine).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let cache_obj = test_cache(&engine, dir.path());
         let digest = cache::digest(TEST_GUEST_WASM);
 
         write_wasm_source(dir.path(), &digest, TEST_GUEST_WASM).unwrap();
@@ -502,9 +540,8 @@ mod tests {
         std::fs::remove_dir_all(cwasm_dir(dir.path())).unwrap();
         assert!(!cwasm_dir(dir.path()).exists());
 
-        let cache_obj = ComponentCache::new();
         let _loaded = cache_obj
-            .get_or_load(&engine, &linker, dir.path(), &digest)
+            .get_or_load(&digest)
             .expect("should recompile from the persisted source wasm");
 
         // Recompiling should have re-published a cwasm for next time.
@@ -516,12 +553,9 @@ mod tests {
     #[test]
     fn get_or_load_fails_cleanly_with_no_cwasm_and_no_source() {
         let engine = build_engine().unwrap();
-        let linker = build_linker(&engine).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let cache_obj = ComponentCache::new();
-        assert!(cache_obj
-            .get_or_load(&engine, &linker, dir.path(), &"c".repeat(64))
-            .is_err());
+        let cache_obj = test_cache(&engine, dir.path());
+        assert!(cache_obj.get_or_load(&"c".repeat(64)).is_err());
     }
 
     #[test]
@@ -602,14 +636,54 @@ mod tests {
     #[test]
     fn component_cache_evicts_by_byte_budget() {
         let engine = build_engine().unwrap();
-        let linker = build_linker(&engine).unwrap();
-        let cache = ComponentCache::with_capacity_and_byte_budget(256, 1);
+        let linker = Arc::new(build_linker(&engine).unwrap());
+        let cache = ComponentCache::new(engine.clone(), linker.clone(), PathBuf::new(), 256, 1);
         let component = wasmtime::component::Component::new(&engine, TEST_GUEST_WASM).unwrap();
-        let pre = Arc::new(crate::runtime::instantiate_pre(&linker, &component).unwrap());
+        let pre = Arc::new(crate::sandbox::instantiate_pre(&linker, &component).unwrap());
         cache.insert("d1", pre, 100);
         // Weight (100) far exceeds the 1-byte budget, so the entry must
         // have been evicted immediately after insertion.
         assert_eq!(cache.inner.lock().unwrap().total_bytes, 0);
         assert!(cache.inner.lock().unwrap().lru.is_empty());
+    }
+
+    /// An unreadable pointer might reference any blob: GC must error out and
+    /// delete nothing, not treat it as "unreferenced".
+    #[test]
+    fn gc_aborts_on_unreadable_pointer_and_deletes_nothing() {
+        let engine = build_engine().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = "b".repeat(64);
+        std::fs::create_dir_all(wasm_dir(dir.path())).unwrap();
+        let blob = wasm_dir(dir.path()).join(format!("{orphan}.wasm"));
+        std::fs::write(&blob, b"y").unwrap();
+        // A directory where a pointer file should be: reading it errors with
+        // something other than NotFound, whoever runs the test.
+        std::fs::create_dir_all(dir.path().join("tenants/tenant-a/fn-a")).unwrap();
+
+        let err = gc_unreferenced_blobs(dir.path(), &engine, Duration::ZERO);
+        assert!(err.is_err(), "expected GC to abort, got {err:?}");
+        assert!(
+            blob.exists(),
+            "nothing may be deleted when a pointer is unreadable"
+        );
+    }
+
+    #[test]
+    fn re_upload_of_existing_source_bumps_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = cache::digest(b"x");
+        write_wasm_source(dir.path(), &digest, b"x").unwrap();
+        let path = wasm_path(dir.path(), &digest);
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        write_wasm_source(dir.path(), &digest, b"x").unwrap();
+        assert!(!older_than(&path, Duration::from_secs(3600)));
     }
 }

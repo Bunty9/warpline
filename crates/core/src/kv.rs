@@ -24,10 +24,11 @@ pub const ENTRY_OVERHEAD_BYTES: usize = 64;
 
 /// Errors a [`KvStore`] implementation can hand back to the host. The host
 /// turns [`KvError::QuotaExceeded`] into a guest trap (see
-/// `runtime::warpline::host::kv::Host::put`) rather than a guest-visible
+/// `sandbox::warpline::host::kv::Host::put`) rather than a guest-visible
 /// `Result` — quota is an operational limit, not something the WIT contract
 /// models as guest-recoverable.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KvError {
     #[error("tenant kv quota exceeded: {used_bytes} used + {added_bytes} new > {cap_bytes} cap")]
     QuotaExceeded {
@@ -35,16 +36,23 @@ pub enum KvError {
         added_bytes: usize,
         cap_bytes: usize,
     },
+    /// The storage backend failed (connection lost, I/O error, ...). Traps
+    /// the guest, like quota errors.
+    #[error("kv backend error: {0}")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Bytes-in, bytes-out KV interface used by the `warpline:host/kv` capability.
+/// Implement it to back guests' `kv` with your own storage and pass it to
+/// [`RuntimeBuilder::kv`](crate::RuntimeBuilder::kv).
 /// `tenant` is supplied by the host on every call — see the module docs for
 /// why it's a parameter rather than folded into `key` by string
 /// concatenation.
 #[async_trait]
 pub trait KvStore: Send + Sync {
-    /// Look up `key` under `tenant`. Returns `None` if absent.
-    async fn get(&self, tenant: &str, key: &str) -> Option<Vec<u8>>;
+    /// Look up `key` under `tenant`. `Ok(None)` if absent; `Err` if the
+    /// backend failed (which traps the calling guest).
+    async fn get(&self, tenant: &str, key: &str) -> Result<Option<Vec<u8>>, KvError>;
     /// Write (or overwrite) `tenant`'s `key -> value`.
     async fn put(&self, tenant: &str, key: &str, value: Vec<u8>) -> Result<(), KvError>;
 }
@@ -97,9 +105,9 @@ impl Default for MemKv {
 
 #[async_trait]
 impl KvStore for MemKv {
-    async fn get(&self, tenant: &str, key: &str) -> Option<Vec<u8>> {
+    async fn get(&self, tenant: &str, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         let composite = (tenant.to_string(), key.to_string());
-        self.inner.read().await.entries.get(&composite).cloned()
+        Ok(self.inner.read().await.entries.get(&composite).cloned())
     }
 
     async fn put(&self, tenant: &str, key: &str, value: Vec<u8>) -> Result<(), KvError> {
@@ -157,8 +165,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(kv.get("a", "b/x").await.unwrap(), b"from-a-b-x");
-        assert_eq!(kv.get("a/b", "x").await.unwrap(), b"from-a-slash-b-x");
+        assert_eq!(kv.get("a", "b/x").await.unwrap().unwrap(), b"from-a-b-x");
+        assert_eq!(
+            kv.get("a/b", "x").await.unwrap().unwrap(),
+            b"from-a-slash-b-x"
+        );
     }
 
     #[tokio::test]
@@ -177,7 +188,7 @@ mod tests {
         // Same key, same size — the old entry's cost is freed before the
         // new one is charged, so this fits exactly.
         kv.put("t", "k", vec![1u8; 10]).await.unwrap();
-        assert_eq!(kv.get("t", "k").await.unwrap(), vec![1u8; 10]);
+        assert_eq!(kv.get("t", "k").await.unwrap().unwrap(), vec![1u8; 10]);
     }
 
     #[tokio::test]

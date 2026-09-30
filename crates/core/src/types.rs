@@ -1,15 +1,11 @@
-//! Per-invocation host context attached to the wasmtime `Store`.
+//! Limits and name validation, plus (crate-private) the per-invocation host
+//! context attached to the wasmtime `Store`.
 //!
-//! One [`HostCtx`] is constructed for every call to [`crate::runtime::invoke`].
-//! It carries tenant identity, the KV backend, the outbound-HTTP allowlist +
-//! shared `reqwest::Client`, the WASI p2 state, the per-invocation KV/log
-//! quota counters, and the [`TenantLimiter`] that enforces the memory/table
-//! cap and records peak usage for metering.
-//!
-//! The hand-written `HttpReq`/`HttpResp` envelopes from Phase 1 are gone —
-//! `wasmtime::component::bindgen!` in `runtime.rs` generates `Request` /
-//! `Response` types straight from `crates/core/wit/warpline.wit`, so this module no
-//! longer needs to mirror them by hand.
+//! [`Limits`] is what an embedder hands to [`Runtime::invoke`](crate::Runtime::invoke)
+//! on every call. `HostCtx` carries tenant identity, the KV backend, the
+//! outbound-HTTP allowlist + shared `reqwest::Client`, the WASI p2 state, the
+//! per-invocation KV/log quota counters, and the `TenantLimiter` that
+//! enforces the memory/table cap and records peak usage for metering.
 
 use std::sync::Arc;
 
@@ -75,11 +71,11 @@ pub fn validate_mem_cap_bytes(v: i64) -> Result<(), ConfigError> {
 
 /// A "plausible hostname" is anything `url::Host::parse` accepts — a
 /// domain name or an IP literal, both of which `http-out::fetch`'s
-/// allowlist check (`runtime::http_fetch`) compares against verbatim.
+/// allowlist check (`sandbox::http_fetch`) compares against verbatim.
 ///
 /// Returns the *normalized* form of each host (lowercased, trailing
 /// root-label dot trimmed) rather than echoing back what was submitted —
-/// `runtime::http_fetch` compares a request's already-normalized host
+/// `sandbox::http_fetch` compares a request's already-normalized host
 /// against whatever was stored here, so storing the raw, unnormalized
 /// input (e.g. `API.Example.com.`) would silently make the allowlist
 /// entry never match. Callers (`warpline-control`'s admin route) persist
@@ -159,40 +155,30 @@ pub fn parse_bearer(header_value: &str) -> Option<&str> {
 }
 
 /// Per-invocation host context. See module docs.
-pub struct HostCtx {
-    pub tenant_id: String,
-    pub fn_name: String,
-    pub kv: Arc<dyn KvStore>,
-    /// Outbound HTTP host allowlist (deny-by-default — see
-    /// `runtime::host_http_out`).
-    pub allowed_hosts: Vec<String>,
-    /// When `false` (the default outside tests), `http-out::fetch` refuses
-    /// to connect to loopback/private/link-local/etc. addresses — see
-    /// `runtime::is_blocked_ip`. Tests that stand up a `127.0.0.1` server
-    /// set this `true`.
-    pub allow_private_egress: bool,
-    /// Shared `reqwest::Client` — cheap to clone, expensive to build (each
-    /// one owns a connection pool), so callers construct one per process and
-    /// pass it into every `HostCtx`.
-    pub http_client: reqwest::Client,
+pub(crate) struct HostCtx {
+    pub(crate) tenant_id: String,
+    pub(crate) fn_name: String,
+    pub(crate) kv: Arc<dyn KvStore>,
+    /// Outbound HTTP host allowlist (deny-by-default).
+    pub(crate) allowed_hosts: Vec<String>,
+    /// When `false`, `http-out::fetch` refuses to connect to
+    /// loopback/private/link-local/etc. addresses.
+    pub(crate) allow_private_egress: bool,
+    /// Shared `reqwest::Client` — cheap to clone, expensive to build.
+    pub(crate) http_client: reqwest::Client,
     /// Memory/table cap + peak-usage tracker, installed on the `Store` via
     /// `store.limiter(|c| &mut c.limiter)`.
-    pub limiter: TenantLimiter,
-    /// `kv::put` calls made so far this invocation — capped at
-    /// [`crate::runtime::MAX_KV_PUTS_PER_INVOCATION`].
+    pub(crate) limiter: TenantLimiter,
+    /// `kv::put` calls made so far this invocation.
     pub(crate) kv_put_count: usize,
-    /// `kv::put` value bytes written so far this invocation — capped at
-    /// [`crate::runtime::MAX_KV_PUT_BYTES_PER_INVOCATION`].
+    /// `kv::put` bytes written so far this invocation.
     pub(crate) kv_put_bytes: usize,
-    /// `log::emit` lines emitted so far this invocation — capped at
-    /// [`crate::runtime::MAX_LOG_LINES_PER_INVOCATION`].
+    /// `log::emit` lines emitted so far this invocation.
     pub(crate) log_line_count: usize,
-    /// `log::emit` message bytes emitted so far this invocation — capped at
-    /// [`crate::runtime::MAX_LOG_BYTES_PER_INVOCATION`].
+    /// `log::emit` message bytes emitted so far this invocation.
     pub(crate) log_bytes: usize,
     /// Set once the log limit has been hit, so the "log output suppressed"
-    /// notice is only emitted once per invocation instead of once per
-    /// dropped line.
+    /// notice is only emitted once per invocation.
     pub(crate) log_suppressed_notified: bool,
     wasi_ctx: WasiCtx,
     table: ResourceTable,
@@ -202,8 +188,7 @@ impl HostCtx {
     /// Build a [`HostCtx`] with a deny-by-default WASI p2 context: no
     /// preopens, no env, no args, no network — only what the guest's Rust
     /// std needs to link (clocks, random, a stdio sink).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         tenant_id: String,
         fn_name: String,
         kv: Arc<dyn KvStore>,
@@ -267,16 +252,16 @@ const MAX_MEMORIES: usize = 4;
 /// intended cap. Tracking a running `total_bytes` across every memory this
 /// limiter has seen closes that.
 #[derive(Debug)]
-pub struct TenantLimiter {
-    pub mem_cap_bytes: usize,
+pub(crate) struct TenantLimiter {
+    pub(crate) mem_cap_bytes: usize,
     /// Sum of `desired - current` over every accepted `memory_growing` call
     /// — the combined size of every core memory in the store.
     total_bytes: usize,
     /// High-water mark of `Self::total_bytes`.
-    pub peak_bytes: usize,
+    pub(crate) peak_bytes: usize,
     /// Set once `memory_growing` rejects a request — lets `invoke`
     /// distinguish "guest hit the memory cap" from any other trap.
-    pub cap_hit: bool,
+    pub(crate) cap_hit: bool,
     table_cap_elems: usize,
     /// Sum of `desired - current` over every accepted `table_growing` call,
     /// mirroring `total_bytes` for tables.
@@ -284,7 +269,7 @@ pub struct TenantLimiter {
 }
 
 impl TenantLimiter {
-    pub fn new(mem_cap_bytes: usize) -> Self {
+    fn new(mem_cap_bytes: usize) -> Self {
         Self {
             mem_cap_bytes,
             total_bytes: 0,

@@ -1,34 +1,41 @@
-//! warpline-core — runtime building blocks for the warpline multi-tenant
-//! WASM function host.
+//! warpline-core — a multi-tenant WebAssembly function runtime you embed in
+//! your own app.
 //!
-//! Modules:
-//! - [`runtime`] — `Engine`/`Linker` builders, `wasmtime::component::bindgen!`
-//!   host bindings for `crates/core/wit/warpline.wit`, the epoch ticker, and
-//!   [`runtime::invoke`].
-//! - [`kv`] — [`kv::KvStore`] trait + in-memory implementation, scoped per
-//!   tenant by [`types::HostCtx`].
-//! - [`meter`] — [`Usage`] and the [`MeterSink`] trait invocations report to.
-//! - [`cache`] — content-hash `.cwasm` cache on local disk, now over
-//!   `wasmtime::component::Component`.
-//! - [`registry`] — pointer files mapping `(tenant, func)` to a content
-//!   digest, plus the in-memory `Component` LRU built on top of `cache`.
-//! - `pg` (feature `postgres`, on by default) — everything Postgres:
-//!   schema-isolated migrations, bearer-token auth, tenant admin and the
-//!   batching [`MeterSink`]. Nothing in this crate reads environment
-//!   variables or migrates implicitly.
-//! - [`types`] — [`types::HostCtx`] and [`types::TenantLimiter`], the
-//!   per-invocation state attached to every `Store`.
+//! Hold a [`Runtime`], [`publish`](Runtime::publish) components under
+//! `(tenant, function)` names and [`invoke`](Runtime::invoke) them with
+//! per-call [`Limits`]. Guests get a tenant-scoped [`KvStore`], logging and
+//! allowlisted outbound HTTP; CPU (epoch ticks), memory, output size,
+//! per-tenant concurrency and total memory are all capped, and every
+//! invocation that reaches a guest is reported to a [`MeterSink`].
+//!
+//! - [`runtime`] — the [`Runtime`] facade, its config and builder.
+//! - [`kv`] — the [`KvStore`] trait and the in-memory [`MemKv`].
+//! - [`meter`] — [`Usage`] and the [`MeterSink`] trait.
+//! - `pg` (feature `postgres`, on by default) — schema-isolated migrations,
+//!   bearer-token auth, tenant admin and a batching [`MeterSink`]. Nothing in
+//!   this crate reads environment variables or migrates implicitly.
+//! - [`types`] — [`Limits`], name validation and config validators.
 
 #![warn(missing_debug_implementations)]
 
-pub mod cache;
+mod cache;
+mod error;
 pub mod kv;
 pub mod meter;
 #[cfg(feature = "postgres")]
 pub mod pg;
-pub mod registry;
+mod registry;
 pub mod runtime;
+mod sandbox;
 pub mod types;
 
+pub use cache::digest;
+pub use error::{Error, InvokeError, PublishError};
+pub use kv::{KvError, KvStore, MemKv};
 pub use meter::{MeterSink, Usage};
-pub use types::Limits;
+pub use registry::GC_GRACE_PERIOD;
+pub use runtime::{Invocation, Runtime, RuntimeBuilder, RuntimeConfig, Staged};
+pub use types::{valid_name, ConfigError, Limits};
+
+pub use bytes::Bytes;
+pub use wasmtime;

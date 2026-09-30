@@ -16,10 +16,8 @@ use axum::http::{Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
-use warpline_core::kv::MemKv;
 use warpline_core::pg::{self, Authenticator, PgMeter};
-use warpline_core::registry::ComponentCache;
-use warpline_core::runtime::{build_engine, build_http_client, build_linker, EpochTicker};
+use warpline_core::{Runtime, RuntimeConfig};
 
 const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -162,36 +160,27 @@ async fn auth_config_and_metering_against_real_postgres() {
     let url = require_test_db!();
     let (pool, auth) = connect(&url).await;
 
-    let engine = build_engine().expect("build engine");
-    let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let mut control_state = warpline_control::AppState::new(
-        engine.clone(),
-        linker.clone(),
-        dir.path().to_path_buf(),
-        Some(auth.clone()),
-    );
+    let control_runtime = Runtime::new(RuntimeConfig::new(dir.path())).expect("build runtime");
+    let mut control_state = warpline_control::AppState::new(control_runtime, Some(auth.clone()));
     control_state.admin_token = Some("test-admin-token".to_string());
     let control = warpline_control::router(control_state);
 
-    let ticker = EpochTicker::spawn(engine.clone());
     let (meter, _meter_handle) = PgMeter::spawn(pool.clone(), 10_000);
+    // Some tests deliberately target a loopback test server; the guarded
+    // resolver would otherwise refuse it regardless of the tenant's own
+    // allowlist.
+    let mut cfg = RuntimeConfig::new(dir.path());
+    cfg.allow_private_egress = true;
+    let runtime = Runtime::builder(cfg)
+        .meter(Arc::new(meter))
+        .build()
+        .expect("build runtime");
     let host_state = warpline_host::AppState {
-        engine,
-        linker,
-        modules_dir: dir.path().to_path_buf(),
-        component_cache: Arc::new(ComponentCache::new()),
-        kv: Arc::new(MemKv::new()),
-        http_client: build_http_client(true).expect("build http client"),
-        // The allowed_hosts test below deliberately targets a loopback
-        // test server; the guarded resolver would otherwise refuse it
-        // regardless of the tenant's own allowlist.
-        allow_private_egress: true,
+        runtime,
         auth: Some(auth),
         metrics_handle: warpline_host::metrics_handle(),
-        ticker: Arc::new(ticker),
-        meter: Arc::new(meter),
     };
     let host = warpline_host::router(host_state);
 
@@ -287,33 +276,27 @@ async fn admin_cpu_budget_config_is_enforced_and_persisted() {
     let url = require_test_db!();
     let (pool, auth) = connect(&url).await;
 
-    let engine = build_engine().expect("build engine");
-    let linker = build_linker(&engine).expect("build linker");
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let mut control_state = warpline_control::AppState::new(
-        engine.clone(),
-        linker.clone(),
-        dir.path().to_path_buf(),
-        Some(auth.clone()),
-    );
+    let control_runtime = Runtime::new(RuntimeConfig::new(dir.path())).expect("build runtime");
+    let mut control_state = warpline_control::AppState::new(control_runtime, Some(auth.clone()));
     control_state.admin_token = Some("test-admin-token".to_string());
     let control = warpline_control::router(control_state);
 
-    let ticker = EpochTicker::spawn(engine.clone());
     let (meter, _meter_handle) = PgMeter::spawn(pool.clone(), 10_000);
+    // Some tests deliberately target a loopback test server; the guarded
+    // resolver would otherwise refuse it regardless of the tenant's own
+    // allowlist.
+    let mut cfg = RuntimeConfig::new(dir.path());
+    cfg.allow_private_egress = true;
+    let runtime = Runtime::builder(cfg)
+        .meter(Arc::new(meter))
+        .build()
+        .expect("build runtime");
     let host_state = warpline_host::AppState {
-        engine,
-        linker,
-        modules_dir: dir.path().to_path_buf(),
-        component_cache: Arc::new(ComponentCache::new()),
-        kv: Arc::new(MemKv::new()),
-        http_client: build_http_client(true).expect("build http client"),
-        allow_private_egress: true,
+        runtime,
         auth: Some(auth),
         metrics_handle: warpline_host::metrics_handle(),
-        ticker: Arc::new(ticker),
-        meter: Arc::new(meter),
     };
     let host = warpline_host::router(host_state);
 

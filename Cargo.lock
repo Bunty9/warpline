@@ -3371,22 +3371,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warpline-core",
- "wasmtime",
 ]
 
 [[package]]
 name = "warpline-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
+ "bytes",
  "criterion",
  "getrandom 0.3.4",
  "hex",
  "lru",
  "reqwest",
- "serde",
- "serde_json",
  "sha2",
  "sqlx",
  "tempfile",
@@ -3407,7 +3404,6 @@ dependencies = [
  "bytes",
  "metrics",
  "metrics-exporter-prometheus",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -3420,7 +3416,6 @@ dependencies = [
  "tracing-subscriber",
  "warpline-control",
  "warpline-core",
- "wasmtime",
 ]
 
 [[package]]

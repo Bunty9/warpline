@@ -7,11 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use warpline_core::{
-    kv::MemKv,
     pg::{self, Authenticator, PgMeter},
-    registry::{self, ComponentCache},
-    runtime::{build_engine, build_http_client, build_linker, EpochTicker},
-    MeterSink,
+    MeterSink, Runtime, RuntimeConfig, GC_GRACE_PERIOD,
 };
 use warpline_host::{metrics_handle, metrics_router, router, shutdown_signal, AppState, LogMeter};
 
@@ -31,18 +28,16 @@ async fn main() -> anyhow::Result<()> {
     let auth = connect_auth().await?;
     let insecure_dev = auth.is_none();
 
-    let engine = build_engine()?;
-    let linker = build_linker(&engine)?;
-    let ticker = EpochTicker::spawn(engine.clone());
     // Deny-by-default: outbound HTTP refuses loopback/private/link-local/etc.
     // targets unless explicitly opted into (e.g. local dev against a
-    // sidecar). See `warpline_core::runtime::is_blocked_ip`.
-    let allow_private_egress =
+    // sidecar).
+    let mut cfg = RuntimeConfig::new(
+        env_nonempty("WARPLINE_MODULES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./modules")),
+    );
+    cfg.allow_private_egress =
         env_nonempty("WARPLINE_ALLOW_PRIVATE_EGRESS").is_some_and(|v| v == "1");
-    let http_client = build_http_client(allow_private_egress)?;
-    let modules_dir = env_nonempty("WARPLINE_MODULES_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./modules"));
 
     let (meter, meter_handle): (Arc<dyn MeterSink>, _) = match &auth {
         Some(a) => {
@@ -63,18 +58,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_handle = metrics_handle();
 
+    let runtime = Runtime::builder(cfg).meter(meter).build()?;
     let state = AppState {
-        engine,
-        linker,
-        modules_dir,
-        component_cache: Arc::new(ComponentCache::new()),
-        kv: Arc::new(MemKv::new()),
-        http_client,
-        allow_private_egress,
+        runtime,
         auth,
         metrics_handle: metrics_handle.clone(),
-        ticker: Arc::new(ticker),
-        meter,
     };
 
     // `/metrics` on its own, loopback-only-by-default listener (finding 6)
@@ -95,21 +83,12 @@ async fn main() -> anyhow::Result<()> {
     // the control plane in this process, sharing the engine so both sides
     // agree on the `.cwasm` compatibility hash.
     if env_nonempty("WARPLINE_EMBED_CONTROL").is_some_and(|v| v == "1") {
-        std::fs::create_dir_all(&state.modules_dir)?;
-        match registry::gc_unreferenced_blobs(
-            &state.modules_dir,
-            &state.engine,
-            registry::GC_GRACE_PERIOD,
-        ) {
+        match state.runtime.gc(GC_GRACE_PERIOD).await {
             Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
             Err(e) => tracing::warn!(error = %e, "startup GC failed"),
         }
-        let mut control_state = warpline_control::AppState::new(
-            state.engine.clone(),
-            state.linker.clone(),
-            state.modules_dir.clone(),
-            state.auth.clone(),
-        );
+        let mut control_state =
+            warpline_control::AppState::new(state.runtime.clone(), state.auth.clone());
         control_state.admin_token = env_nonempty("WARPLINE_ADMIN_TOKEN");
         let default_control_bind = if insecure_dev {
             "127.0.0.1:8081"

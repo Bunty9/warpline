@@ -11,9 +11,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use warpline_core::kv::MemKv;
-use warpline_core::registry::ComponentCache;
-use warpline_core::runtime::{build_engine, build_http_client, build_linker, EpochTicker};
+use warpline_core::{Runtime, RuntimeConfig};
 
 const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -38,35 +36,23 @@ fn multipart_body(field_name: &str, content: &[u8]) -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
-fn control_router(
-    engine: wasmtime::Engine,
-    linker: wasmtime::component::Linker<warpline_core::types::HostCtx>,
-    modules_dir: &Path,
-) -> axum::Router {
-    let state = warpline_control::AppState::new(engine, linker, modules_dir.to_path_buf(), None);
-    warpline_control::router(state)
+/// Control and host each get their own `Runtime` over the same modules dir,
+/// like two processes sharing a volume: the pointer files are the handoff.
+fn control_router(modules_dir: &Path) -> axum::Router {
+    let runtime = Runtime::new(RuntimeConfig::new(modules_dir)).expect("build runtime");
+    warpline_control::router(warpline_control::AppState::new(runtime, None))
 }
 
-fn host_router(
-    engine: wasmtime::Engine,
-    linker: wasmtime::component::Linker<warpline_core::types::HostCtx>,
-    modules_dir: &Path,
-    ticker: EpochTicker,
-) -> axum::Router {
-    let state = warpline_host::AppState {
-        engine,
-        linker,
-        modules_dir: modules_dir.to_path_buf(),
-        component_cache: Arc::new(ComponentCache::new()),
-        kv: Arc::new(MemKv::new()),
-        http_client: build_http_client(true).expect("build http client"),
-        allow_private_egress: false,
+fn host_router(modules_dir: &Path) -> axum::Router {
+    let runtime = Runtime::builder(RuntimeConfig::new(modules_dir))
+        .meter(Arc::new(warpline_host::LogMeter))
+        .build()
+        .expect("build runtime");
+    warpline_host::router(warpline_host::AppState {
+        runtime,
         auth: None,
         metrics_handle: warpline_host::metrics_handle(),
-        ticker: Arc::new(ticker),
-        meter: Arc::new(warpline_host::LogMeter),
-    };
-    warpline_host::router(state)
+    })
 }
 
 async fn upload(
@@ -120,16 +106,8 @@ async fn invoke(
 #[tokio::test]
 async fn upload_then_invoke_end_to_end() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let engine = build_engine().expect("build engine");
-
-    let control = control_router(engine.clone(), build_linker(&engine).unwrap(), dir.path());
-    let ticker = EpochTicker::spawn(engine.clone());
-    let host = host_router(
-        engine.clone(),
-        build_linker(&engine).unwrap(),
-        dir.path(),
-        ticker,
-    );
+    let control = control_router(dir.path());
+    let host = host_router(dir.path());
 
     // Invalid names -> 400, on both routers. ("Bad-Name" is a valid URI
     // path segment but fails `valid_name`'s lowercase-only rule.)
@@ -149,7 +127,7 @@ async fn upload_then_invoke_end_to_end() {
     // Successful upload -> 201, digest matches the source hash.
     let (status, json) = upload(&control, "acme", "echo", TEST_GUEST_WASM).await;
     assert_eq!(status, StatusCode::CREATED, "{json}");
-    let expected_digest = warpline_core::cache::digest(TEST_GUEST_WASM);
+    let expected_digest = warpline_core::digest(TEST_GUEST_WASM);
     assert_eq!(json["digest"], expected_digest);
 
     // Invoke the freshly uploaded function -> 200, echoed body.
@@ -188,34 +166,33 @@ async fn upload_then_invoke_end_to_end() {
 #[tokio::test]
 async fn invoke_recovers_after_cwasm_is_deleted() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let engine = build_engine().expect("build engine");
-
-    let control = control_router(engine.clone(), build_linker(&engine).unwrap(), dir.path());
-    let ticker = EpochTicker::spawn(engine.clone());
-    let host = host_router(
-        engine.clone(),
-        build_linker(&engine).unwrap(),
-        dir.path(),
-        ticker,
-    );
+    let control = control_router(dir.path());
+    let host = host_router(dir.path());
 
     let (status, json) = upload(&control, "acme", "resilient", TEST_GUEST_WASM).await;
     assert_eq!(status, StatusCode::CREATED, "{json}");
     let digest = json["digest"].as_str().unwrap();
 
-    let cwasm_path = warpline_core::registry::cwasm_dir(dir.path())
-        .join(warpline_core::cache::cache_file_name(&engine, digest));
-    assert!(
-        cwasm_path.exists(),
-        "expected a cwasm to have been persisted"
-    );
-    std::fs::remove_file(&cwasm_path).expect("delete cwasm");
-    assert!(!cwasm_path.exists());
+    let cwasm_files = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.path().join("cwasm"))
+            .expect("cwasm dir")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(digest))
+            .collect()
+    };
+    let before = cwasm_files();
+    assert_eq!(before.len(), 1, "expected a cwasm to have been persisted");
+    std::fs::remove_file(&before[0]).expect("delete cwasm");
+    assert!(cwasm_files().is_empty());
 
     let (status, body) = invoke(&host, "acme", "resilient", b"still works").await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(body, b"still works");
 
     // Recompiling on the miss should have re-published the cwasm too.
-    assert!(cwasm_path.exists(), "expected the cwasm to be re-published");
+    assert_eq!(
+        cwasm_files(),
+        before,
+        "expected the cwasm to be re-published"
+    );
 }

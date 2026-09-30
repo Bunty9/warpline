@@ -1,744 +1,523 @@
-//! WASM runtime — Component-Model engine construction, host-import
-//! registration (`wasmtime::component::bindgen!` against
-//! `crates/core/wit/warpline.wit`), the epoch-based CPU ticker, and the `invoke` entry
-//! point used by `warpline-host`.
+//! The [`Runtime`] facade: the one type an embedding app holds.
 //!
-//! ## wasmtime 49 shape
-//!
-//! - `bindgen!` below generates the `Handler` world (imports `kv`, `log`,
-//!   `http-out`; exports `handle`) as **async** on both sides. Imports are
-//!   additionally `trappable`: a host fn returning `Err` inside its outer
-//!   `wasmtime::Result` traps the guest (used for capability-cap
-//!   violations); the WIT-level `result<_, string>` on `http-out::fetch`
-//!   stays a normal guest-visible error.
-//! - [`HostCtx`] (in `types.rs`) implements the generated `Host` traits plus
-//!   `wasmtime_wasi::WasiView`, so one `Linker` serves both the custom
-//!   capability surface and the WASI p2 interfaces a `wasm32-wasip2` guest
-//!   implicitly imports through its std lib.
-//! - CPU budget is enforced by epoch interruption, driven cooperatively
-//!   rather than as a hard interrupt: each `Store` is configured with
-//!   [`wasmtime::Store::epoch_deadline_callback`] returning
-//!   `UpdateDeadline::Yield(1)` one tick at a time, so a long-running guest
-//!   yields back to the tokio executor on every tick instead of blocking
-//!   the worker thread — other tasks (other tenants' invocations, the
-//!   ticker itself) keep making progress. Once the callback has been
-//!   called `budget_ticks` times it returns a distinguishable
-//!   `CpuBudgetExceededMarker` error instead of extending the deadline
-//!   again, which `classify_trap` downcasts to `InvokeError::CpuBudgetExceeded`.
-//!   A single background thread ([`EpochTicker`]) bumps the engine-wide
-//!   epoch every [`EPOCH_TICK_MS`]; each store's deadline is set in ticks.
-//!   This replaced a Phase-1 per-call `tokio::spawn` ticker that bumped the
-//!   epoch for *every* concurrent store, not just the one whose budget had
-//!   actually elapsed.
-//! - A `tokio::time::timeout` wraps the whole call as a wall-clock backstop
-//!   (budget + the http-out timeout + slack) so a guest wedged inside a
-//!   slow host call can't hang the request indefinitely.
+//! A `Runtime` owns the wasmtime engine and linker, the epoch ticker that
+//! enforces CPU budgets, the on-disk module registry (content-addressed
+//! `.wasm`/`.cwasm` blobs plus one pointer file per `(tenant, func)`), the
+//! in-memory component cache, and admission control. It is cheap to clone
+//! (an `Arc`); clones share everything, and the ticker stops only when the
+//! last clone, including those held by in-flight invocations, is gone.
 
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, ResourceLimiter, Store};
+use bytes::Bytes;
+use tokio::sync::Semaphore;
+use wasmtime::component::Linker;
+use wasmtime::Engine;
 
-use crate::types::HostCtx;
+use crate::cache;
+use crate::kv::{KvStore, MemKv};
+use crate::registry::{self, ComponentCache};
+use crate::sandbox::{self, EpochTicker, Failure};
+use crate::types::{valid_name, HostCtx};
+use crate::{Error, InvokeError, Limits, MeterSink, PublishError, Usage};
 
-wasmtime::component::bindgen!({
-    path: "wit",
-    world: "handler",
-    imports: { default: async | trappable },
-    exports: { default: async },
-});
+const MIB: usize = 1024 * 1024;
 
-/// Key length cap for `kv::put`/`kv::get` — exceeding it traps the guest.
-const MAX_KV_KEY_BYTES: usize = 512;
-/// Value length cap for `kv::put` — exceeding it traps the guest (no
-/// silent truncation).
-const MAX_KV_VALUE_BYTES: usize = 1024 * 1024;
-/// Max `kv::put` calls per invocation — exceeding it traps the guest. Caps
-/// unbounded host-memory growth from a guest that puts in a tight loop.
-pub const MAX_KV_PUTS_PER_INVOCATION: usize = 1000;
-/// Max total `kv::put` value bytes per invocation — exceeding it traps the
-/// guest, independent of the per-call `MAX_KV_VALUE_BYTES` cap.
-pub const MAX_KV_PUT_BYTES_PER_INVOCATION: usize = 8 * 1024 * 1024;
-/// `log::emit` messages are truncated (not trapped) at this many bytes.
-const MAX_LOG_MSG_BYTES: usize = 4 * 1024;
-/// Max `log::emit` lines per invocation. Past this, lines are dropped
-/// silently (after one "suppressed" notice) rather than trapping the guest
-/// — logging is diagnostic, not something a guest should be killed over.
-pub const MAX_LOG_LINES_PER_INVOCATION: usize = 100;
-/// Max total `log::emit` message bytes per invocation, mirroring
-/// [`MAX_LOG_LINES_PER_INVOCATION`].
-pub const MAX_LOG_BYTES_PER_INVOCATION: usize = 64 * 1024;
-/// `http-out::fetch` response bodies are capped at this many bytes; the
-/// host stops reading and returns `Err` to the guest once exceeded.
-const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
-/// Per-request timeout for outbound HTTP, applied on the shared
-/// `reqwest::Client` the caller builds and hands to every [`HostCtx`].
-pub const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Configuration for a [`Runtime`]. Build with [`RuntimeConfig::new`] and
+/// adjust the public fields; new fields may be added in minor releases.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RuntimeConfig {
+    /// Root of the module registry. Created if missing.
+    pub modules_dir: PathBuf,
+    /// Let guests' `http-out` reach loopback/private/link-local addresses.
+    /// One flag drives both the DNS resolver filter and the IP-literal check.
+    /// Default `false`; enable only for local development and tests.
+    pub allow_private_egress: bool,
+    /// Total guest memory admitted concurrently, in bytes (default 1 GiB).
+    /// Each invocation weighs its `Limits::mem_cap_bytes` rounded up to whole
+    /// MiB; when the running total would exceed this, the invocation fails
+    /// fast with [`InvokeError::Overloaded`]. At least 1 MiB.
+    pub memory_budget_bytes: usize,
+    /// Invocations one tenant may have in flight (default 32); beyond that
+    /// [`InvokeError::TenantBusy`]. At least 1.
+    pub max_in_flight_per_tenant: usize,
+    /// Largest output an invocation may return, bytes (default 8 MiB).
+    pub max_output_bytes: usize,
+    /// Components kept loaded in memory (default 256). At least 1.
+    pub component_cache_entries: usize,
+    /// Serialized bytes of loaded components kept in memory (default 512 MiB).
+    pub component_cache_bytes: usize,
+    /// Concurrent compilations in [`Runtime::stage`] (default half the cores,
+    /// at least 1).
+    pub compile_concurrency: usize,
+}
 
-/// Returns true iff `ip` is not part of the public, routable Internet:
-/// loopback, RFC 1918 private, link-local (169.254/16, fe80::/10),
-/// unspecified, broadcast, CGNAT (100.64.0.0/10), unique-local (fc00::/7),
-/// multicast, or an IPv4-mapped IPv6 address whose embedded v4 address is
-/// itself one of those.
-///
-/// Used to block SSRF via `http-out::fetch` reaching the host's own
-/// network — both for DNS answers (see `GuardedResolver`) and for URL IP
-/// literals, which reqwest hands straight to the connector without ever
-/// calling the configured resolver.
-pub fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_blocked_ipv4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_blocked_ipv4(mapped);
-            }
-            let seg = v6.segments();
-            let low32 = std::net::Ipv4Addr::new(
-                (seg[6] >> 8) as u8,
-                seg[6] as u8,
-                (seg[7] >> 8) as u8,
-                seg[7] as u8,
-            );
-            // Prefixes that embed an IPv4 address: judge by the embedded one.
-            // `::a.b.c.d` (IPv4-compatible) and `64:ff9b::/96` (NAT64).
-            if seg[..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified()
-                || seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
-            {
-                return is_blocked_ipv4(low32);
-            }
-            // 6to4 `2002::/16` carries the IPv4 address in segments 1..3.
-            if seg[0] == 0x2002 {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[1] >> 8) as u8,
-                    seg[1] as u8,
-                    (seg[2] >> 8) as u8,
-                    seg[2] as u8,
-                );
-                return is_blocked_ipv4(v4);
-            }
-            let seg0 = seg[0];
-            (seg0 == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // 64:ff9b:1::/48 local NAT64
-                || v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+impl RuntimeConfig {
+    /// Defaults everywhere except the registry location.
+    pub fn new(modules_dir: impl Into<PathBuf>) -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self {
+            modules_dir: modules_dir.into(),
+            allow_private_egress: false,
+            memory_budget_bytes: 1024 * MIB,
+            max_in_flight_per_tenant: 32,
+            max_output_bytes: 8 * MIB,
+            component_cache_entries: 256,
+            component_cache_bytes: 512 * MIB,
+            compile_concurrency: (cores / 2).max(1),
         }
     }
 }
 
-fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
-        || v4.octets()[0] == 0 // 0.0.0.0/8 "this network"
-        || v4.octets()[..3] == [192, 0, 0] // 192.0.0.0/24 IETF protocol assignments
-        || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
-        || v4.octets()[0] >= 240 // 240.0.0.0/4 reserved (incl. broadcast)
+/// Builder for a [`Runtime`] with a custom KV store and/or meter.
+#[must_use]
+pub struct RuntimeBuilder {
+    cfg: RuntimeConfig,
+    kv: Option<Arc<dyn KvStore>>,
+    meter: Option<Arc<dyn MeterSink>>,
 }
 
-/// `reqwest::dns::Resolve` impl that resolves via `tokio::net::lookup_host`
-/// and, unless `allow_private` is set, filters every blocked address
-/// ([`is_blocked_ip`]) out of the answer — erroring if nothing public is
-/// left. Installed on the shared client by [`build_http_client`].
+impl RuntimeBuilder {
+    /// Back guests' `kv` capability with `kv` (default: a fresh [`MemKv`]).
+    pub fn kv(mut self, kv: Arc<dyn KvStore>) -> Self {
+        self.kv = Some(kv);
+        self
+    }
+
+    /// Report every invocation that reached the guest to `sink` (default:
+    /// none).
+    pub fn meter(mut self, sink: Arc<dyn MeterSink>) -> Self {
+        self.meter = Some(sink);
+        self
+    }
+
+    /// Validate the config, create the registry directory and start the
+    /// epoch ticker. Synchronous; only the async methods need a tokio runtime.
+    pub fn build(self) -> Result<Runtime, Error> {
+        let cfg = self.cfg;
+        if cfg.memory_budget_bytes < MIB {
+            return Err(Error::Config("memory_budget_bytes must be at least 1 MiB"));
+        }
+        if cfg.max_in_flight_per_tenant == 0 {
+            return Err(Error::Config("max_in_flight_per_tenant must be at least 1"));
+        }
+        if cfg.component_cache_entries == 0 {
+            return Err(Error::Config("component_cache_entries must be at least 1"));
+        }
+        if cfg.compile_concurrency == 0 {
+            return Err(Error::Config("compile_concurrency must be at least 1"));
+        }
+        std::fs::create_dir_all(&cfg.modules_dir)?;
+
+        let engine = sandbox::build_engine()?;
+        let linker = Arc::new(sandbox::build_linker(&engine)?);
+        let http_client = sandbox::build_http_client(cfg.allow_private_egress)
+            .map_err(|e| Error::Internal(format!("failed to build http client: {e}")))?;
+        let components = ComponentCache::new(
+            engine.clone(),
+            linker.clone(),
+            cfg.modules_dir.clone(),
+            cfg.component_cache_entries,
+            cfg.component_cache_bytes,
+        );
+        let ticker = EpochTicker::spawn(engine.clone());
+        Ok(Runtime(Arc::new(Inner {
+            admission: Arc::new(Semaphore::new(cfg.memory_budget_bytes / MIB)),
+            compile_slots: Arc::new(Semaphore::new(cfg.compile_concurrency)),
+            in_flight: Mutex::new(HashMap::new()),
+            kv: self.kv.unwrap_or_else(|| Arc::new(MemKv::new())),
+            meter: self.meter,
+            http_client,
+            components,
+            linker,
+            engine,
+            cfg,
+            _ticker: ticker,
+        })))
+    }
+}
+
+impl std::fmt::Debug for RuntimeBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeBuilder")
+            .field("cfg", &self.cfg)
+            .field("custom_kv", &self.kv.is_some())
+            .field("meter", &self.meter.is_some())
+            .finish()
+    }
+}
+
+struct Inner {
+    cfg: RuntimeConfig,
+    engine: Engine,
+    linker: Arc<Linker<HostCtx>>,
+    kv: Arc<dyn KvStore>,
+    meter: Option<Arc<dyn MeterSink>>,
+    http_client: reqwest::Client,
+    components: ComponentCache,
+    /// Permits are MiB of guest memory.
+    admission: Arc<Semaphore>,
+    in_flight: Mutex<HashMap<String, usize>>,
+    compile_slots: Arc<Semaphore>,
+    /// Stops (and joins) the epoch thread when the last `Arc<Inner>` goes.
+    _ticker: EpochTicker,
+}
+
+/// A multi-tenant WebAssembly function runtime.
 ///
-/// This only covers hostnames: reqwest never calls the configured resolver
-/// for a URL whose host is already an IP literal, so [`http_fetch`]
-/// separately checks that case before it ever opens a connection.
-struct GuardedResolver {
-    allow_private: bool,
+/// Publish a component under `(tenant, function)`, then invoke it with
+/// per-call [`Limits`]. Cheap to clone; clones share all state.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use warpline_core::{Bytes, Limits, MemKv, Runtime, RuntimeConfig};
+///
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// let runtime = Runtime::builder(RuntimeConfig::new("./modules"))
+///     .kv(Arc::new(MemKv::new()))
+///     .build()?;
+///
+/// let wasm = std::fs::read("handler.wasm")?;
+/// runtime.publish("acme", "hello", Bytes::from(wasm)).await?;
+///
+/// let limits = Limits::new(50, 32 << 20)?;
+/// let out = runtime.invoke("acme", "hello", b"hi".to_vec(), &limits).await?;
+/// println!("{} bytes back, {} us cpu", out.output.len(), out.usage.cpu_us);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Capacity
+///
+/// `invoke` is fail-fast: it never queues. A tenant beyond its in-flight
+/// cap gets [`InvokeError::TenantBusy`] and an invocation the memory budget
+/// cannot admit gets [`InvokeError::Overloaded`]; map those to 429/503 (see
+/// [`InvokeError::http_status`]) and let the caller retry.
+#[derive(Clone)]
+pub struct Runtime(Arc<Inner>);
+
+/// A component that has been compiled, type-checked and persisted, but is not
+/// yet reachable by any function name. See [`Runtime::stage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Staged {
+    /// Hex SHA-256 of the component bytes; also [`digest`](crate::digest).
+    pub digest: String,
 }
 
-impl reqwest::dns::Resolve for GuardedResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let allow_private = self.allow_private;
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<std::net::SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if allow_private {
-                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+/// A successful invocation.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Invocation {
+    /// The bytes the guest returned.
+    pub output: Vec<u8>,
+    /// What the call used. `cpu_us` has 1 ms granularity.
+    pub usage: Usage,
+}
+
+impl Runtime {
+    /// A runtime with an in-memory KV store and no meter.
+    pub fn new(cfg: RuntimeConfig) -> Result<Self, Error> {
+        Self::builder(cfg).build()
+    }
+
+    /// Start building a runtime with a custom KV store and/or meter.
+    pub fn builder(cfg: RuntimeConfig) -> RuntimeBuilder {
+        RuntimeBuilder {
+            cfg,
+            kv: None,
+            meter: None,
+        }
+    }
+
+    /// The wasmtime engine (the same version as [`crate::wasmtime`]), e.g.
+    /// to compile components ahead of time with matching settings.
+    pub fn engine(&self) -> &Engine {
+        &self.0.engine
+    }
+
+    /// Compile `wasm`, check it fits the handler world and persist it, without
+    /// making it reachable. Compilation runs on the blocking pool behind the
+    /// `compile_concurrency` semaphore. Idempotent: re-staging identical bytes
+    /// refreshes their timestamps so a concurrent [`gc`](Self::gc) leaves them
+    /// for the [`activate`](Self::activate) that follows.
+    ///
+    /// Split from [`activate`](Self::activate) so a caller can do its own
+    /// bookkeeping (a quota check, a database row) between the two.
+    pub async fn stage(&self, wasm: Bytes) -> Result<Staged, PublishError> {
+        let inner = self.0.clone();
+        let permit = inner
+            .compile_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::other("compile semaphore closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let modules_dir = &inner.cfg.modules_dir;
+            let cwasm_dir = registry::cwasm_dir(modules_dir);
+            let (component, digest, fresh) = cache::compile(&inner.engine, &wasm, &cwasm_dir)
+                .map_err(|e| match e {
+                    Error::Wasmtime(e) => PublishError::Compile(e),
+                    Error::Io(e) => PublishError::Io(e),
+                    other => PublishError::Io(std::io::Error::other(other.to_string())),
+                })?;
+            sandbox::typecheck_component(&inner.linker, &component)
+                .map_err(PublishError::ImportMismatch)?;
+            // Only a typechecked component is persisted.
+            if fresh {
+                cache::persist_cwasm(&component, &inner.engine, &cwasm_dir, &digest)
+                    .map_err(into_publish_err)?;
+            } else if let Err(e) =
+                registry::touch(&cwasm_dir.join(cache::cache_file_name(&inner.engine, &digest)))
+            {
+                tracing::warn!(%digest, error = %e, "could not refresh .cwasm mtime");
             }
-            let public: Vec<std::net::SocketAddr> = addrs
-                .into_iter()
-                .filter(|a| !is_blocked_ip(a.ip()))
-                .collect();
-            if public.is_empty() {
-                return Err(Box::from(format!(
-                    "{host}: dns resolution returned only blocked/private addresses"
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
+            registry::write_wasm_source(modules_dir, &digest, &wasm).map_err(into_publish_err)?;
+            Ok(Staged { digest })
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("stage task failed: {e}")))?
+    }
+
+    /// Atomically point `(tenant, func)` at `staged`. Invocations that start
+    /// afterwards run the new component; ones already running are unaffected.
+    pub async fn activate(
+        &self,
+        tenant: &str,
+        func: &str,
+        staged: &Staged,
+    ) -> Result<(), PublishError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(PublishError::InvalidName);
+        }
+        let inner = self.0.clone();
+        let (tenant, func, digest) = (tenant.to_owned(), func.to_owned(), staged.digest.clone());
+        tokio::task::spawn_blocking(move || {
+            registry::write_pointer(&inner.cfg.modules_dir, &tenant, &func, &digest)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("activate task failed: {e}")))?
+        .map_err(into_publish_err)
+    }
+
+    /// [`stage`](Self::stage) then [`activate`](Self::activate).
+    pub async fn publish(
+        &self,
+        tenant: &str,
+        func: &str,
+        wasm: Bytes,
+    ) -> Result<Staged, PublishError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(PublishError::InvalidName);
+        }
+        let staged = self.stage(wasm).await?;
+        self.activate(tenant, func, &staged).await?;
+        Ok(staged)
+    }
+
+    /// Run `(tenant, func)` on `input` under `limits`.
+    ///
+    /// Fails fast, in this order: [`InvalidName`](InvokeError::InvalidName),
+    /// [`TenantBusy`](InvokeError::TenantBusy),
+    /// [`Overloaded`](InvokeError::Overloaded),
+    /// [`NotFound`](InvokeError::NotFound). Once the guest has started, the
+    /// configured [`MeterSink`] is called exactly once with the outcome,
+    /// including when the returned future is dropped mid-call (then as a
+    /// failure). The tenant's in-flight slot and the memory admission are
+    /// released on every exit path.
+    pub async fn invoke(
+        &self,
+        tenant: &str,
+        func: &str,
+        input: Vec<u8>,
+        limits: &Limits,
+    ) -> Result<Invocation, InvokeError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(InvokeError::InvalidName);
+        }
+        // Held for the whole call: keeps the ticker alive even if every
+        // other `Runtime` handle is dropped meanwhile.
+        let inner = self.0.clone();
+
+        let _slot = TenantSlot::acquire(&inner, tenant).ok_or(InvokeError::TenantBusy)?;
+
+        let weight = limits.mem_cap_bytes.div_ceil(MIB).max(1);
+        let weight = u32::try_from(weight)
+            .ok()
+            .filter(|w| (*w as usize) <= inner.cfg.memory_budget_bytes / MIB)
+            .ok_or(InvokeError::Overloaded)?;
+        let _admission = inner
+            .admission
+            .clone()
+            .try_acquire_many_owned(weight)
+            .map_err(|_| InvokeError::Overloaded)?;
+
+        let pre = {
+            let inner = inner.clone();
+            let (t, f) = (tenant.to_owned(), func.to_owned());
+            tokio::task::spawn_blocking(move || inner.components.resolve(&t, &f))
+                .await
+                .map_err(|e| {
+                    InvokeError::Load(Error::Internal(format!("resolve task failed: {e}")))
+                })?
+                .map_err(InvokeError::Load)?
+                .ok_or(InvokeError::NotFound)?
+        };
+
+        let ctx = HostCtx::new(
+            tenant.to_owned(),
+            func.to_owned(),
+            inner.kv.clone(),
+            limits.allowed_hosts.clone(),
+            inner.cfg.allow_private_egress,
+            inner.http_client.clone(),
+            limits.mem_cap_bytes,
+        );
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        let mut meter = MeterGuard {
+            sink: inner.meter.as_deref(),
+            tenant,
+            func,
+            ticks: &ticks,
+            started,
+            done: false,
+        };
+
+        let run = sandbox::run(&pre, ctx, &input, limits.cpu_budget_ms, ticks.clone()).await;
+        let usage = Usage::new(
+            ticks.load(Ordering::Relaxed) * (sandbox::EPOCH_TICK_MS * 1000),
+            started.elapsed().as_micros() as u64,
+            run.mem_peak,
+        );
+        let limit = inner.cfg.max_output_bytes;
+        let result = match run.result {
+            Ok(output) if output.len() > limit => Err(InvokeError::OutputTooLarge { usage, limit }),
+            Ok(output) => Ok(Invocation { output, usage }),
+            Err(Failure::CpuBudget) => Err(InvokeError::CpuBudgetExceeded {
+                usage,
+                budget_ms: limits.cpu_budget_ms,
+            }),
+            Err(Failure::MemCap { cap_bytes }) => {
+                Err(InvokeError::MemoryCapExceeded { usage, cap_bytes })
             }
-            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+            Err(Failure::WallClock) => Err(InvokeError::WallClockTimeout { usage }),
+            Err(Failure::Trap(source)) => Err(InvokeError::GuestTrap { usage, source }),
+        };
+        meter.finish(usage, result.is_ok());
+        result
+    }
+
+    /// Delete blobs no pointer references (and `.cwasm` files compiled by a
+    /// different engine), skipping anything modified within `grace`. Returns
+    /// the number of files removed. Errors out before deleting anything if a
+    /// pointer file cannot be read. Run it at startup, with
+    /// [`GC_GRACE_PERIOD`](crate::GC_GRACE_PERIOD) as `grace`.
+    pub async fn gc(&self, grace: Duration) -> Result<usize, Error> {
+        let inner = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            registry::gc_unreferenced_blobs(&inner.cfg.modules_dir, &inner.engine, grace)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("gc task failed: {e}")))?
+    }
+}
+
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("modules_dir", &self.0.cfg.modules_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+fn into_publish_err(e: Error) -> PublishError {
+    match e {
+        Error::Io(e) => PublishError::Io(e),
+        other => PublishError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
+/// RAII in-flight counter for one tenant; released on every exit path.
+struct TenantSlot {
+    inner: Arc<Inner>,
+    tenant: String,
+}
+
+impl TenantSlot {
+    fn acquire(inner: &Arc<Inner>, tenant: &str) -> Option<Self> {
+        let mut map = inner.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get_mut(tenant) {
+            Some(n) if *n >= inner.cfg.max_in_flight_per_tenant => return None,
+            Some(n) => *n += 1,
+            None => {
+                map.insert(tenant.to_owned(), 1);
+            }
+        }
+        Some(Self {
+            inner: inner.clone(),
+            tenant: tenant.to_owned(),
         })
     }
 }
 
-/// Build the single shared `reqwest::Client` every [`HostCtx`] should be
-/// constructed with for `http-out::fetch`.
-///
-/// - `redirect::Policy::none()` — redirects could otherwise walk a request
-///   from an allowlisted host to a non-allowlisted one; the allowlist check
-///   in `http_fetch` only ever sees the first hop.
-/// - a blanket 5 s timeout so a slow upstream can't pin a tenant's request
-///   open indefinitely.
-/// - a `GuardedResolver` that, when `allow_private` is `false`, refuses
-///   to hand back loopback/private/link-local/etc. addresses — see
-///   [`is_blocked_ip`]. Callers that need to reach `127.0.0.1` (tests
-///   standing up local servers) pass `true`.
-pub fn build_http_client(allow_private: bool) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(HTTP_TIMEOUT)
-        .dns_resolver(Arc::new(GuardedResolver { allow_private }))
-        // A proxy resolves the target itself, bypassing `GuardedResolver`.
-        .no_proxy()
-        .build()
-}
-
-/// Build the shared wasmtime [`Engine`] used by every invocation.
-///
-/// - `epoch_interruption(true)` for cheap CPU-budget enforcement — see
-///   [`EpochTicker`] and README "Design tradeoffs" §
-///   "epoch_interruption over fuel metering".
-/// - `consume_fuel(false)` explicitly off — we picked epochs.
-/// - `cranelift_opt_level(Speed)` and `parallel_compilation(true)` because
-///   the control plane compiles modules out-of-band on upload.
-///
-/// Async component instantiation/calls are available unconditionally once
-/// the `async` cargo feature is enabled (wasmtime 49 dropped the
-/// `Config::async_support` toggle — it's a no-op kept only for source
-/// compat).
-pub fn build_engine() -> anyhow::Result<Engine> {
-    let mut cfg = Config::new();
-    cfg.epoch_interruption(true)
-        .consume_fuel(false)
-        .cranelift_opt_level(wasmtime::OptLevel::Speed)
-        .parallel_compilation(true);
-    Engine::new(&cfg).map_err(Into::into)
-}
-
-/// How often [`EpochTicker`] bumps the engine epoch, in milliseconds. Also
-/// the unit `invoke` converts `cpu_budget_ms` into epoch ticks with.
-pub const EPOCH_TICK_MS: u64 = 1;
-
-/// Background epoch pump: one `std::thread` per [`Engine`], incrementing
-/// its epoch counter every [`EPOCH_TICK_MS`] until dropped.
-///
-/// Phase 1 spawned a `tokio::spawn` timer *per invocation* that bumped the
-/// engine epoch once after that call's budget elapsed — since the epoch is
-/// engine-global, that interrupted every other concurrently running store
-/// too. One ticker per engine, ticking on a fixed cadence, fixes that: each
-/// store just sets its own deadline in ticks and only *that* store's
-/// callback (see `invoke`) fires when the ticker carries the epoch past it.
-pub struct EpochTicker {
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl EpochTicker {
-    /// Spawn the ticker thread for `engine`.
-    pub fn spawn(engine: Engine) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let handle = std::thread::Builder::new()
-            .name("warpline-epoch-ticker".into())
-            .spawn(move || {
-                // Sleep to an absolute schedule rather than `sleep(tick)`
-                // in a loop: each relative sleep overshoots a little, and
-                // since budgets are counted in ticks that drift compounds
-                // (~+12% at a 100 ms budget before this change).
-                let tick = Duration::from_millis(EPOCH_TICK_MS);
-                let mut next = std::time::Instant::now();
-                while !stop_thread.load(Ordering::Relaxed) {
-                    next += tick;
-                    let now = std::time::Instant::now();
-                    if next > now {
-                        std::thread::sleep(next - now);
-                    } else if now - next > tick * 10 {
-                        // Badly behind (host suspended, starved thread):
-                        // resync instead of bursting ticks.
-                        next = now;
-                    }
-                    engine.increment_epoch();
-                }
-            })
-            .expect("spawn epoch ticker thread");
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for EpochTicker {
+impl Drop for TenantSlot {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let mut map = self
+            .inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&self.tenant) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.tenant);
+            }
         }
     }
 }
 
-/// Build the [`Linker`] once per process (or per test) and reuse it across
-/// every `invoke` call — registering host imports is not free and none of
-/// them close over per-invocation state (that lives in [`HostCtx`], read
-/// out of the `Store` at call time).
-pub fn build_linker(engine: &Engine) -> anyhow::Result<Linker<HostCtx>> {
-    let mut linker = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    Handler::add_to_linker::<HostCtx, HasSelf<HostCtx>>(&mut linker, |ctx| ctx)?;
-    Ok(linker)
+/// Reports to the meter exactly once: explicitly via [`finish`](Self::finish),
+/// or from `Drop` (as a failure, with the ticks counted so far) if the
+/// invocation future was cancelled mid-call, so cancelling cannot make CPU
+/// use free.
+struct MeterGuard<'a> {
+    sink: Option<&'a dyn MeterSink>,
+    tenant: &'a str,
+    func: &'a str,
+    ticks: &'a AtomicU64,
+    started: Instant,
+    done: bool,
 }
 
-/// Build the pre-instantiated [`HandlerPre`] for `component` against
-/// `linker` — every import check and the `handle`-export check that
-/// `instantiate_async` would otherwise redo on *every* invoke, done once
-/// here instead. [`registry::ComponentCache`](crate::registry::ComponentCache) calls this once per loaded
-/// component and caches the result; [`invoke`] takes the cached
-/// `HandlerPre` rather than a bare `Component` + `Linker` pair so a warm
-/// invoke's `instantiate_async` skips straight to instance creation.
-///
-/// `linker.instantiate_pre` alone already checks every import; wrapping the
-/// result in [`HandlerPre::new`] additionally checks the `handle` export,
-/// which `instantiate_pre` doesn't look at.
-pub fn instantiate_pre(
-    linker: &Linker<HostCtx>,
-    component: &Component,
-) -> anyhow::Result<HandlerPre<HostCtx>> {
-    let instance_pre = linker.instantiate_pre(component)?;
-    Ok(HandlerPre::new(instance_pre)?)
-}
-
-/// Type-check `component` against `linker` — every import the component
-/// declares must be satisfiable by what `linker` provides (WASI p2 plus the
-/// `warpline:host` capability surface) and it must export `handle` with the
-/// right signature. Used by `warpline-control` at upload time so a
-/// component that imports something we don't provide is rejected with a
-/// 422 there, rather than failing to instantiate on its first invoke.
-pub fn typecheck_component(linker: &Linker<HostCtx>, component: &Component) -> anyhow::Result<()> {
-    instantiate_pre(linker, component)?;
-    Ok(())
-}
-
-/// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8
-/// character.
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
+impl MeterGuard<'_> {
+    fn finish(&mut self, usage: Usage, ok: bool) {
+        self.done = true;
+        if let Some(sink) = self.sink {
+            sink.record(self.tenant, self.func, usage, ok);
+        }
     }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
-impl warpline::host::kv::Host for HostCtx {
-    async fn get(&mut self, key: String) -> wasmtime::Result<Option<Vec<u8>>> {
-        if key.len() > MAX_KV_KEY_BYTES {
-            wasmtime::bail!("kv key exceeds {MAX_KV_KEY_BYTES} byte cap");
+impl Drop for MeterGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
         }
-        Ok(self.kv.get(&self.tenant_id, &key).await)
-    }
-
-    async fn put(&mut self, key: String, value: Vec<u8>) -> wasmtime::Result<()> {
-        if key.len() > MAX_KV_KEY_BYTES {
-            wasmtime::bail!("kv key exceeds {MAX_KV_KEY_BYTES} byte cap");
-        }
-        if value.len() > MAX_KV_VALUE_BYTES {
-            wasmtime::bail!("kv value exceeds {MAX_KV_VALUE_BYTES} byte cap");
-        }
-        self.kv_put_count += 1;
-        if self.kv_put_count > MAX_KV_PUTS_PER_INVOCATION {
-            wasmtime::bail!("kv put count exceeds {MAX_KV_PUTS_PER_INVOCATION} per invocation");
-        }
-        // Keys count too: empty values under unique keys still cost memory.
-        self.kv_put_bytes += key.len() + value.len();
-        if self.kv_put_bytes > MAX_KV_PUT_BYTES_PER_INVOCATION {
-            wasmtime::bail!(
-                "kv put bytes exceeds {MAX_KV_PUT_BYTES_PER_INVOCATION} per invocation"
+        if let Some(sink) = self.sink {
+            let usage = Usage::new(
+                self.ticks.load(Ordering::Relaxed) * (sandbox::EPOCH_TICK_MS * 1000),
+                self.started.elapsed().as_micros() as u64,
+                0,
             );
-        }
-        self.kv.put(&self.tenant_id, &key, value).await?;
-        Ok(())
-    }
-}
-
-impl warpline::host::log::Host for HostCtx {
-    async fn emit(&mut self, level: String, msg: String) -> wasmtime::Result<()> {
-        if self.log_line_count >= MAX_LOG_LINES_PER_INVOCATION
-            || self.log_bytes >= MAX_LOG_BYTES_PER_INVOCATION
-        {
-            if !self.log_suppressed_notified {
-                self.log_suppressed_notified = true;
-                tracing::warn!(
-                    tenant = self.tenant_id.as_str(),
-                    func = self.fn_name.as_str(),
-                    "log output suppressed: per-invocation limit exceeded"
-                );
-            }
-            return Ok(());
-        }
-
-        let msg = truncate_utf8(&msg, MAX_LOG_MSG_BYTES);
-        self.log_line_count += 1;
-        self.log_bytes += msg.len();
-
-        let tenant = self.tenant_id.as_str();
-        let func = self.fn_name.as_str();
-        match level.to_ascii_lowercase().as_str() {
-            "trace" => tracing::trace!(tenant, func, msg, "guest log"),
-            "debug" => tracing::debug!(tenant, func, msg, "guest log"),
-            "warn" | "warning" => tracing::warn!(tenant, func, msg, "guest log"),
-            "error" => tracing::error!(tenant, func, msg, "guest log"),
-            // Unknown levels (and "info") map to info — never drop a guest
-            // log line just because it used a level we don't recognise.
-            _ => tracing::info!(tenant, func, msg, "guest log"),
-        }
-        Ok(())
-    }
-}
-
-impl warpline::host::http_out::Host for HostCtx {
-    async fn fetch(
-        &mut self,
-        req: warpline::host::http_out::Request,
-    ) -> wasmtime::Result<Result<warpline::host::http_out::Response, String>> {
-        // Clone the things `http_fetch` needs out of `self` up front:
-        // `WasiCtx` holds `Box<dyn ... + Send>` trait objects that are not
-        // `Sync`, so holding a `&HostCtx` across an `.await` would make
-        // this whole async fn's future non-`Send` — which `add_to_linker_async`
-        // requires. Owned clones (small `Vec`s, bools, and an Arc-backed
-        // Client) sidestep that entirely.
-        let allowed_hosts = self.allowed_hosts.clone();
-        let allow_private = self.allow_private_egress;
-        let client = self.http_client.clone();
-        Ok(http_fetch(allowed_hosts, allow_private, client, req).await)
-    }
-}
-
-/// The actual `http-out::fetch` implementation, split out of the trait impl
-/// so its guest-visible error path (`Result<Response, String>`) stays
-/// separate from the trap path (reserved for host bugs, not guest input).
-async fn http_fetch(
-    allowed_hosts: Vec<String>,
-    allow_private: bool,
-    client: reqwest::Client,
-    req: warpline::host::http_out::Request,
-) -> Result<warpline::host::http_out::Response, String> {
-    let url = url::Url::parse(&req.url).map_err(|e| format!("invalid url: {e}"))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => return Err(format!("scheme {other} not allowed")),
-    }
-    // `url` already lowercases the host; also strip a trailing root-label
-    // dot ("allowed.com." is the same host as "allowed.com") so neither an
-    // allowlist entry nor a guest-supplied URL can dodge the comparison by
-    // way of it.
-    let host = url.host_str().unwrap_or_default().trim_end_matches('.');
-    let allowed = allowed_hosts
-        .iter()
-        .any(|allowed| allowed.trim_end_matches('.') == host);
-    if !allowed {
-        return Err(format!("host {host} not allowed"));
-    }
-
-    // reqwest never consults the configured DNS resolver when the URL's
-    // host is already an IP literal — it hands that straight to the
-    // connector — so the private/blocked-range check has to happen here
-    // too, not just inside `GuardedResolver`.
-    if !allow_private {
-        let literal_ip = match url.host() {
-            Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
-            Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
-            _ => None,
-        };
-        if let Some(ip) = literal_ip {
-            if is_blocked_ip(ip) {
-                return Err(format!("host {ip} is a blocked/private address"));
-            }
-        }
-    }
-
-    let method = reqwest::Method::from_bytes(req.method.as_bytes())
-        .map_err(|e| format!("invalid method: {e}"))?;
-
-    let mut resp = client
-        .request(method, url)
-        .body(req.body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-
-    let status = resp.status().as_u16();
-    let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("body read failed: {e}"))?
-    {
-        if body.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
-            return Err(format!(
-                "response body exceeds {MAX_HTTP_BODY_BYTES} byte cap"
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    Ok(warpline::host::http_out::Response { status, body })
-}
-
-/// Successful outcome of [`invoke`].
-#[derive(Debug)]
-pub struct InvokeOutcome {
-    pub output: Vec<u8>,
-    /// Wall-clock duration of the guest's `handle` call, in microseconds.
-    /// Not real CPU time — wasmtime has no cheap per-store CPU-time counter
-    /// — but for the short, mostly-CPU-bound handlers this host targets,
-    /// wall time during the call is a reasonable proxy and is documented as
-    /// such wherever it's surfaced (metering rows, API responses).
-    pub cpu_us: u64,
-    pub mem_peak_bytes: usize,
-}
-
-/// Failure outcome of [`invoke`]. The host crate maps these to HTTP status
-/// codes (see `warpline-host`'s `status_for` — budget/wall-timeout -> 408,
-/// memory cap -> 507, guest trap/instantiate failure -> 500).
-#[derive(Debug, thiserror::Error)]
-pub enum InvokeError {
-    #[error("cpu budget exceeded ({budget_ms} ms)")]
-    CpuBudgetExceeded { budget_ms: u64 },
-    #[error("memory cap exceeded (peak {peak_bytes} bytes, cap {cap_bytes} bytes)")]
-    MemoryCapExceeded { peak_bytes: usize, cap_bytes: usize },
-    #[error("wall-clock timeout after {0:?}")]
-    WallClockTimeout(Duration),
-    #[error("guest trapped: {0}")]
-    GuestTrap(String),
-    #[error("failed to instantiate component: {0}")]
-    Instantiate(String),
-}
-
-/// Marker error returned by the `epoch_deadline_callback` installed in
-/// [`invoke`] once a store's tick budget is exhausted. [`classify_trap`]
-/// downcasts to this to recognise "the CPU budget ran out" independent of
-/// wasmtime's own `Trap::Interrupt` (which the callback-based, yielding
-/// deadline never actually raises, but which is kept as a fallback below).
-#[derive(Debug)]
-struct CpuBudgetExceededMarker;
-
-impl std::fmt::Display for CpuBudgetExceededMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cpu budget exceeded")
-    }
-}
-
-impl std::error::Error for CpuBudgetExceededMarker {}
-
-/// Returns true iff `err` is (or wraps) the epoch-deadline interrupt this
-/// module's `epoch_deadline_callback` raises once a store's CPU-budget
-/// ticks are exhausted — either our own [`CpuBudgetExceededMarker`], or
-/// wasmtime's own [`wasmtime::Trap::Interrupt`] (kept as a fallback; the
-/// callback-based, yielding deadline never actually raises it, but a
-/// future wasmtime version might change that). Shared by [`classify_trap`]
-/// (a failed `call_handle`) and `invoke`'s own check on a failed
-/// `instantiate_async` — the epoch can just as well fire mid-instantiation
-/// for a very small budget, before `call_handle` ever runs.
-fn is_cpu_budget_error(err: &wasmtime::Error) -> bool {
-    err.downcast_ref::<CpuBudgetExceededMarker>().is_some()
-        || matches!(
-            err.downcast_ref::<wasmtime::Trap>(),
-            Some(t) if *t == wasmtime::Trap::Interrupt
-        )
-}
-
-/// Classify a failed `call_handle` into an [`InvokeError`], using the
-/// [`crate::types::TenantLimiter`] state left behind in `store` and
-/// [`is_cpu_budget_error`].
-///
-/// CPU-budget exhaustion is checked *before* the memory-cap flag: a store
-/// whose `memory.grow` was rejected doesn't trap on the spot (wasm just
-/// sees `-1` from the failed grow and keeps running), so a guest that
-/// retries allocation in a loop can hit the CPU budget afterwards with
-/// `cap_hit` still set from the earlier rejection. Checking the interrupt
-/// first reports the trap that actually ended the call.
-fn classify_trap(err: wasmtime::Error, store: &Store<HostCtx>, budget_ms: u64) -> InvokeError {
-    if is_cpu_budget_error(&err) {
-        return InvokeError::CpuBudgetExceeded { budget_ms };
-    }
-    let limiter = &store.data().limiter;
-    if limiter.cap_hit {
-        return InvokeError::MemoryCapExceeded {
-            peak_bytes: limiter.peak_bytes,
-            cap_bytes: limiter.mem_cap_bytes,
-        };
-    }
-    InvokeError::GuestTrap(err.to_string())
-}
-
-/// Invoke `pre`'s exported `handle(input: list<u8>) -> list<u8>` inside a
-/// fresh [`Store`] carrying `ctx`.
-///
-/// `pre` is a [`HandlerPre`] built once (by [`instantiate_pre`], via
-/// [`registry::ComponentCache`](crate::registry::ComponentCache)) rather than a bare `Component` + `Linker`
-/// pair — `pre.instantiate_async` below skips the import/export type-check
-/// `Handler::instantiate_async(store, component, linker)` would otherwise
-/// redo on every single call.
-///
-/// `cpu_budget_ms` is enforced via a cooperative-yield epoch deadline
-/// callback (see module docs); the whole call is additionally bounded by a
-/// wall-clock `tokio::time::timeout` of `cpu_budget_ms` plus [`HTTP_TIMEOUT`]
-/// plus a second of slack, so a guest stuck making slow host calls can't hang
-/// the caller even if epoch ticks can't reach it (e.g. blocked inside a
-/// host import awaiting I/O).
-pub async fn invoke(
-    engine: &Engine,
-    pre: &HandlerPre<HostCtx>,
-    ctx: HostCtx,
-    input: Vec<u8>,
-    cpu_budget_ms: u64,
-) -> Result<InvokeOutcome, InvokeError> {
-    let wall_budget = Duration::from_millis(cpu_budget_ms) + HTTP_TIMEOUT + Duration::from_secs(1);
-    let budget_ticks = (cpu_budget_ms / EPOCH_TICK_MS).max(1);
-
-    let call = async move {
-        let mut store = Store::new(engine, ctx);
-        store.limiter(|c| &mut c.limiter as &mut dyn ResourceLimiter);
-
-        // One tick at a time: on every epoch tick that reaches the
-        // deadline, yield to the tokio executor and extend the deadline by
-        // one more tick, until `budget_ticks` ticks have elapsed — at
-        // which point return a distinguishable error instead. This is what
-        // lets a long-running guest cooperate with other work on the same
-        // executor instead of pinning the worker thread until it traps.
-        let mut ticks_elapsed: u64 = 0;
-        store.epoch_deadline_callback(move |_store| {
-            ticks_elapsed += 1;
-            if ticks_elapsed >= budget_ticks {
-                Err(wasmtime::Error::new(CpuBudgetExceededMarker))
-            } else {
-                Ok(wasmtime::UpdateDeadline::Yield(1))
-            }
-        });
-        store.set_epoch_deadline(1);
-
-        let bindings = match pre.instantiate_async(&mut store).await {
-            Ok(bindings) => bindings,
-            // A very small `cpu_budget_ms` can exhaust the epoch deadline
-            // during instantiation itself, before `call_handle` ever runs —
-            // classify that the same way a mid-call interrupt is (408, not
-            // a generic 500 instantiate failure).
-            Err(e) if is_cpu_budget_error(&e) => {
-                return Err(InvokeError::CpuBudgetExceeded {
-                    budget_ms: cpu_budget_ms,
-                })
-            }
-            Err(e) => return Err(InvokeError::Instantiate(e.to_string())),
-        };
-
-        let started = Instant::now();
-        let result = bindings.call_handle(&mut store, &input).await;
-        let cpu_us = started.elapsed().as_micros() as u64;
-
-        match result {
-            Ok(output) => Ok(InvokeOutcome {
-                output,
-                cpu_us,
-                mem_peak_bytes: store.data().limiter.peak_bytes,
-            }),
-            Err(e) => Err(classify_trap(e, &store, cpu_budget_ms)),
-        }
-    };
-
-    match tokio::time::timeout(wall_budget, call).await {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => Err(InvokeError::WallClockTimeout(wall_budget)),
-    }
-}
-
-impl std::fmt::Debug for EpochTicker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EpochTicker").finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_blocked_ip;
-    use std::net::IpAddr;
-
-    #[test]
-    fn is_blocked_ip_classification_table() {
-        let cases: &[(&str, bool)] = &[
-            // loopback
-            ("127.0.0.1", true),
-            ("127.255.255.255", true),
-            ("::1", true),
-            // RFC 1918 private
-            ("10.0.0.1", true),
-            ("172.16.0.1", true),
-            ("172.31.255.255", true),
-            ("192.168.1.1", true),
-            // link-local
-            ("169.254.1.1", true),
-            ("fe80::1", true),
-            // unspecified
-            ("0.0.0.0", true),
-            ("::", true),
-            // broadcast
-            ("255.255.255.255", true),
-            // CGNAT 100.64.0.0/10
-            ("100.64.0.1", true),
-            ("100.127.255.255", true),
-            ("100.63.255.255", false),
-            ("100.128.0.0", false),
-            // unique-local fc00::/7
-            ("fc00::1", true),
-            ("fd12:3456::1", true),
-            // multicast
-            ("224.0.0.1", true),
-            ("ff02::1", true),
-            // IPv4-mapped IPv6 of a blocked address
-            ("::ffff:127.0.0.1", true),
-            ("::ffff:10.0.0.1", true),
-            // embedded-IPv4 forms: IPv4-compatible, NAT64, 6to4
-            ("::10.0.0.1", true),
-            ("::8.8.8.8", false),
-            ("64:ff9b::a00:1", true),
-            ("64:ff9b::808:808", false),
-            ("64:ff9b:1::1", true),
-            ("2002:a00:1::", true),
-            ("2002:808:808::", false),
-            // other reserved IPv4
-            ("0.1.2.3", true),
-            ("192.0.0.8", true),
-            ("198.18.0.1", true),
-            ("198.20.0.1", false),
-            ("240.0.0.1", true),
-            // public addresses
-            ("8.8.8.8", false),
-            ("1.1.1.1", false),
-            ("93.184.216.34", false),
-            ("2001:4860:4860::8888", false),
-            ("::ffff:8.8.8.8", false),
-            // outside private ranges but adjacent
-            ("172.15.255.255", false),
-            ("172.32.0.0", false),
-        ];
-        for (ip, expected) in cases {
-            let parsed: IpAddr = ip.parse().expect("valid ip literal in test table");
-            assert_eq!(
-                is_blocked_ip(parsed),
-                *expected,
-                "is_blocked_ip({ip}) expected {expected}"
-            );
+            sink.record(self.tenant, self.func, usage, false);
         }
     }
 }

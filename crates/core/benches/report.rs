@@ -10,17 +10,9 @@
 //! Kept under ~60s total: 10k sequential warm invokes plus a handful of
 //! single-shot trap/cap checks.
 
-use std::sync::Arc;
 use std::time::Instant;
 
-use wasmtime::component::Component;
-
-use warpline_core::kv::{KvStore, MemKv};
-use warpline_core::runtime::{
-    build_engine, build_http_client, build_linker, instantiate_pre, invoke, EpochTicker,
-    InvokeError,
-};
-use warpline_core::types::HostCtx;
+use warpline_core::{Bytes, InvokeError, Limits, Runtime, RuntimeConfig};
 
 const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -37,49 +29,32 @@ const PERCENTILE_SAMPLES: usize = 10_000;
 /// total runtime down.
 const THROUGHPUT_SAMPLES: usize = 5_000;
 
-fn make_ctx(kv: Arc<dyn KvStore>, http_client: reqwest::Client, mem_cap_bytes: usize) -> HostCtx {
-    HostCtx::new(
-        "bench-tenant".to_string(),
-        "bench-fn".to_string(),
-        kv,
-        Vec::new(),
-        true,
-        http_client,
-        mem_cap_bytes,
-    )
-}
+const TENANT: &str = "bench-tenant";
+const FUNC: &str = "bench-fn";
 
 fn main() {
-    let engine = build_engine().expect("build engine");
-    let linker = build_linker(&engine).expect("build linker");
-    let _ticker = EpochTicker::spawn(engine.clone());
-    let component = Component::new(&engine, TEST_GUEST_WASM).expect("compile fixture");
-    let pre = instantiate_pre(&linker, &component).expect("instantiate_pre");
-    let kv: Arc<dyn KvStore> = Arc::new(MemKv::new());
-    let http_client = build_http_client(true).expect("build http client");
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rt = Runtime::new(RuntimeConfig::new(dir.path())).expect("build runtime");
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
+    tokio_rt
+        .block_on(rt.publish(TENANT, FUNC, Bytes::from_static(TEST_GUEST_WASM)))
+        .expect("publish fixture");
+    let warm = Limits::new(WARM_BUDGET_MS, DEFAULT_MEM_CAP).expect("limits");
+
+    let echo = || rt.invoke(TENANT, FUNC, b"warm-invoke-echo-payload".to_vec(), &warm);
 
     println!("| Metric | Target | Result |");
     println!("|---|---|---|");
 
     // -- warm_invoke_echo p50/p99 over PERCENTILE_SAMPLES sequential calls --
     let mut samples = Vec::with_capacity(PERCENTILE_SAMPLES);
-    rt.block_on(async {
+    tokio_rt.block_on(async {
         for _ in 0..PERCENTILE_SAMPLES {
-            let ctx = make_ctx(kv.clone(), http_client.clone(), DEFAULT_MEM_CAP);
             let start = Instant::now();
-            invoke(
-                &engine,
-                &pre,
-                ctx,
-                b"warm-invoke-echo-payload".to_vec(),
-                WARM_BUDGET_MS,
-            )
-            .await
-            .expect("invoke ok");
+            echo().await.expect("invoke ok");
             samples.push(start.elapsed());
         }
     });
@@ -97,18 +72,9 @@ fn main() {
 
     // -- throughput: invocations/sec/core on a current_thread runtime --
     let tp_start = Instant::now();
-    rt.block_on(async {
+    tokio_rt.block_on(async {
         for _ in 0..THROUGHPUT_SAMPLES {
-            let ctx = make_ctx(kv.clone(), http_client.clone(), DEFAULT_MEM_CAP);
-            invoke(
-                &engine,
-                &pre,
-                ctx,
-                b"warm-invoke-echo-payload".to_vec(),
-                WARM_BUDGET_MS,
-            )
-            .await
-            .expect("invoke ok");
+            echo().await.expect("invoke ok");
         }
     });
     let inv_per_sec = THROUGHPUT_SAMPLES as f64 / tp_start.elapsed().as_secs_f64();
@@ -116,10 +82,10 @@ fn main() {
 
     // -- cpu_cap_accuracy: `loop` guest, budgets 10/50/100 ms --
     for budget_ms in [10u64, 50, 100] {
-        let ctx = make_ctx(kv.clone(), http_client.clone(), DEFAULT_MEM_CAP);
+        let limits = Limits::new(budget_ms, DEFAULT_MEM_CAP).expect("limits");
         let start = Instant::now();
-        let err = rt
-            .block_on(invoke(&engine, &pre, ctx, b"loop".to_vec(), budget_ms))
+        let err = tokio_rt
+            .block_on(rt.invoke(TENANT, FUNC, b"loop".to_vec(), &limits))
             .expect_err("infinite loop should trap on cpu budget");
         let elapsed = start.elapsed();
         assert!(
@@ -128,23 +94,22 @@ fn main() {
         );
         let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
         let err_ms = elapsed_ms - budget_ms as f64;
+        let cpu_ms = err.usage().map_or(0, |u| u.cpu_us) as f64 / 1000.0;
         println!(
-            "| cpu_cap_accuracy ({budget_ms} ms budget) | budget ± 5 ms | actual {elapsed_ms:.2} ms (error {err_ms:+.2} ms) |"
+            "| cpu_cap_accuracy ({budget_ms} ms budget) | budget (+1 ms tick) ± 5 ms | actual {elapsed_ms:.2} ms (error {err_ms:+.2} ms), metered cpu {cpu_ms:.0} ms |"
         );
     }
 
     // -- mem_cap: `alloc` guest, 16 MiB cap --
     let mem_cap = 16 * 1024 * 1024;
-    let ctx = make_ctx(kv.clone(), http_client.clone(), mem_cap);
-    let err = rt
-        .block_on(invoke(&engine, &pre, ctx, b"alloc".to_vec(), 5_000))
+    let limits = Limits::new(5_000, mem_cap).expect("limits");
+    let err = tokio_rt
+        .block_on(rt.invoke(TENANT, FUNC, b"alloc".to_vec(), &limits))
         .expect_err("runaway allocator should trap on memory cap");
     match err {
-        InvokeError::MemoryCapExceeded {
-            peak_bytes,
-            cap_bytes,
-        } => {
+        InvokeError::MemoryCapExceeded { usage, cap_bytes } => {
             assert_eq!(cap_bytes, mem_cap);
+            let peak_bytes = usage.mem_peak_bytes;
             assert!(
                 peak_bytes <= cap_bytes,
                 "peak {peak_bytes} > cap {cap_bytes}"

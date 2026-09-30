@@ -10,7 +10,7 @@
 //! different, incompatible engine; it just misses the cache and recompiles.
 //! As a second line of defence, if `Component::deserialize` still fails
 //! (corrupt file, partial write that predates the atomic-rename fix, disk
-//! bitrot), `load_or_compile` logs a warning, recompiles from source, and
+//! bitrot), `compile` logs a warning, recompiles from source, and
 //! overwrites the stale entry rather than propagating the error.
 //!
 //! Cold path: compile via `Component::new` (full cranelift), then
@@ -43,7 +43,10 @@ use sha2::{Digest, Sha256};
 use wasmtime::component::Component;
 use wasmtime::Engine;
 
-/// Hex-encoded SHA-256 of `bytes` — the cache key and `.cwasm` file stem.
+use crate::Error;
+
+/// Hex-encoded SHA-256 of `bytes` — the content digest [`Runtime`](crate::Runtime)
+/// identifies a component by ([`Staged::digest`](crate::Staged::digest)).
 pub fn digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -95,20 +98,23 @@ pub(crate) fn is_valid_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The `.cwasm` file name [`load_or_compile`]/[`load_cwasm`] use for a given
-/// source `digest` under `engine`'s current compatibility hash. Exposed so
-/// callers (tests, ops tooling) can locate a cache entry on disk without
-/// duplicating the naming scheme.
-pub fn cache_file_name(engine: &Engine, digest: &str) -> String {
+/// The `.cwasm` file name [`load_cwasm`] uses for a given source `digest`
+/// under `engine`'s current compatibility hash.
+pub(crate) fn cache_file_name(engine: &Engine, digest: &str) -> String {
     format!("{digest}-{}.cwasm", compat_hash(engine))
 }
 
 /// Deserialise `cache_dir/{digest}-{compat}.cwasm` into a [`Component`].
-pub fn load_cwasm(engine: &Engine, cache_dir: &Path, digest: &str) -> anyhow::Result<Component> {
-    anyhow::ensure!(
-        is_valid_digest(digest),
-        "invalid cache digest: expected 64 lowercase hex characters"
-    );
+pub(crate) fn load_cwasm(
+    engine: &Engine,
+    cache_dir: &Path,
+    digest: &str,
+) -> Result<Component, Error> {
+    if !is_valid_digest(digest) {
+        return Err(Error::Corrupt(
+            "invalid cache digest: expected 64 lowercase hex characters".into(),
+        ));
+    }
     let bytes = std::fs::read(cache_dir.join(cache_file_name(engine, digest)))?;
     // SAFETY: see module-level docs — `digest` has just been validated as a
     // 64-hex-char SHA-256, the file name additionally carries the engine's
@@ -123,7 +129,7 @@ pub fn load_cwasm(engine: &Engine, cache_dir: &Path, digest: &str) -> anyhow::Re
 /// leaves a corrupt file at the published path. Shared by every writer of
 /// content-addressed storage under `modules_dir` (`.cwasm` cache, source
 /// `.wasm` blobs, `registry`'s pointer files).
-pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
     std::fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
@@ -136,7 +142,7 @@ pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Res
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o644))?;
     }
-    tmp.persist(dest)?;
+    tmp.persist(dest).map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -145,19 +151,19 @@ pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Res
 /// touching disk. Callers that need to reject a bad component before ever
 /// persisting anything (`warpline-control`'s upload handler — compile,
 /// typecheck, *then* persist, see [`persist_cwasm`]) use this instead of
-/// [`load_or_compile`], which always publishes.
+/// publishing straight away.
 ///
 /// If a cached `.cwasm` entry exists but fails to deserialise (corrupt or
 /// stale), this logs a warning and falls through to recompiling from
 /// `wasm_bytes` — it never propagates the deserialize error. The returned
 /// `bool` is `true` iff that happened (a fresh compile, not a cache hit) —
-/// [`load_or_compile`] uses it to only call [`persist_cwasm`] when there's
+/// callers use it to only call [`persist_cwasm`] when there's
 /// actually something new to publish.
-pub fn compile(
+pub(crate) fn compile(
     engine: &Engine,
     wasm_bytes: &[u8],
     cache_dir: &Path,
-) -> anyhow::Result<(Component, String, bool)> {
+) -> Result<(Component, String, bool), Error> {
     let digest = digest(wasm_bytes);
     let cached = cache_dir.join(cache_file_name(engine, &digest));
 
@@ -179,41 +185,94 @@ pub fn compile(
 }
 
 /// Serialize `component` and publish it to `cache_dir/{digest}-{compat}.cwasm`
-/// (atomically — see `atomic_write`). Split out of [`load_or_compile`] so
-/// callers that must not persist an unchecked component (see [`compile`])
-/// can typecheck first.
+/// (atomically — see `atomic_write`), returning the serialized length.
 ///
 /// Always (re)writes, even if a file is already there at that path: `compile`
 /// falls through to a fresh compile whenever the existing entry failed to
-/// deserialize (corrupt or stale), and that bad entry needs overwriting, not
-/// skipping — there's no cheap way to tell "already-published, valid" apart
-/// from "still there because we couldn't parse it" just from the path
-/// existing.
-pub fn persist_cwasm(
+/// deserialize (corrupt or stale), and that bad entry needs overwriting.
+pub(crate) fn persist_cwasm(
     component: &Component,
     engine: &Engine,
     cache_dir: &Path,
     digest: &str,
-) -> anyhow::Result<()> {
+) -> Result<usize, Error> {
     let dest = cache_dir.join(cache_file_name(engine, digest));
     let serialized = component.serialize()?;
-    atomic_write(cache_dir, &dest, &serialized)
+    atomic_write(cache_dir, &dest, &serialized)?;
+    Ok(serialized.len())
 }
 
-/// [`compile`] + [`persist_cwasm`] in one call, skipping the publish step
-/// on a cache hit (nothing new to write) — the cache always ends up
-/// populated for `wasm_bytes`'s digest either way. Used wherever there's no
-/// separate typecheck gate between compiling and publishing (tests, and
-/// `ComponentCache`'s cwasm-miss recompile-from-source fallback, whose
-/// source bytes were already typechecked once at upload time).
-pub fn load_or_compile(
-    engine: &Engine,
-    wasm_bytes: &[u8],
-    cache_dir: &Path,
-) -> anyhow::Result<Component> {
-    let (component, digest, freshly_compiled) = compile(engine, wasm_bytes, cache_dir)?;
-    if freshly_compiled {
-        persist_cwasm(&component, engine, cache_dir, &digest)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::build_engine;
+
+    const TEST_GUEST_WASM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/test_guest.wasm"
+    ));
+
+    /// [`compile`] + [`persist_cwasm`], skipping the publish on a cache hit.
+    fn load_or_compile(
+        engine: &Engine,
+        wasm_bytes: &[u8],
+        cache_dir: &Path,
+    ) -> Result<Component, Error> {
+        let (component, digest, fresh) = compile(engine, wasm_bytes, cache_dir)?;
+        if fresh {
+            persist_cwasm(&component, engine, cache_dir, &digest)?;
+        }
+        Ok(component)
     }
-    Ok(component)
+
+    #[test]
+    fn second_load_hits_the_cwasm_warm_path() {
+        let engine = build_engine().expect("build engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let _first = load_or_compile(&engine, TEST_GUEST_WASM, dir.path()).expect("cold compile");
+        let digest = digest(TEST_GUEST_WASM);
+        let cwasm_path = dir.path().join(cache_file_name(&engine, &digest));
+        assert!(cwasm_path.exists());
+        let before = std::fs::metadata(&cwasm_path).unwrap().modified().unwrap();
+
+        let _second = load_or_compile(&engine, TEST_GUEST_WASM, dir.path()).expect("warm load");
+        let after = std::fs::metadata(&cwasm_path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "warm load must not rewrite the .cwasm");
+
+        let _third = load_cwasm(&engine, dir.path(), &digest).expect("load_cwasm");
+    }
+
+    #[test]
+    fn recovers_from_corrupt_cwasm() {
+        let engine = build_engine().expect("build engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let digest = digest(TEST_GUEST_WASM);
+        let cwasm_path = dir.path().join(cache_file_name(&engine, &digest));
+        std::fs::write(&cwasm_path, b"not a real cwasm file").expect("write garbage");
+
+        let _component = load_or_compile(&engine, TEST_GUEST_WASM, dir.path())
+            .expect("must recompile over a corrupt cache entry");
+        let _reloaded =
+            load_cwasm(&engine, dir.path(), &digest).expect("recompiled entry should load");
+    }
+
+    #[test]
+    fn load_cwasm_rejects_malformed_digest() {
+        let engine = build_engine().expect("build engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "",
+            "short",
+            "../../etc/passwd",
+            "UPPERCASE0000000000000000000000000000000000000000000000000000",
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
+            assert!(
+                load_cwasm(&engine, dir.path(), bad).is_err(),
+                "expected digest {bad:?} to be rejected"
+            );
+        }
+    }
 }

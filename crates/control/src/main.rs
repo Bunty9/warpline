@@ -9,8 +9,7 @@ use std::time::Duration;
 use warpline_control::{router, AppState};
 use warpline_core::{
     pg::{self, Authenticator},
-    registry,
-    runtime::{build_engine, build_linker},
+    Runtime, RuntimeConfig, GC_GRACE_PERIOD,
 };
 
 #[tokio::main]
@@ -25,22 +24,20 @@ async fn main() -> anyhow::Result<()> {
 
     let auth = connect_auth().await?;
     let insecure_dev = auth.is_none();
-    let engine = build_engine()?;
-    let linker = build_linker(&engine)?;
     let modules_dir = env_nonempty("WARPLINE_MODULES_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./modules"));
-    std::fs::create_dir_all(&modules_dir)?;
+    let runtime = Runtime::new(RuntimeConfig::new(modules_dir))?;
 
     // Run once, before serving: clean up any wasm/cwasm blob no pointer
     // references (finding 3) — e.g. left behind by a crash between
     // persisting a blob and writing its pointer.
-    match registry::gc_unreferenced_blobs(&modules_dir, &engine, registry::GC_GRACE_PERIOD) {
+    match runtime.gc(GC_GRACE_PERIOD).await {
         Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
         Err(e) => tracing::warn!(error = %e, "startup GC failed"),
     }
 
-    let mut state = AppState::new(engine, linker, modules_dir, auth);
+    let mut state = AppState::new(runtime, auth);
     state.admin_token = env_nonempty("WARPLINE_ADMIN_TOKEN");
     let app = router(state);
 

@@ -9,11 +9,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Usage {
-    /// Guest CPU time in microseconds.
-    // ponytail: for now this is the same wall-clock measurement as `wall_us`;
-    // the runtime facade switches it to epoch-tick counting.
+    /// Guest CPU time in microseconds: epoch ticks the guest ran, times 1000
+    /// (1 ms granularity). Time spent waiting to be scheduled, or inside a
+    /// host call, does not count, so this stays close to the budget even when
+    /// the machine is busy.
     pub cpu_us: u64,
-    /// Wall-clock time in microseconds.
+    /// Wall-clock time of the guest call in microseconds, including waiting.
     pub wall_us: u64,
     /// Peak guest linear memory, bytes (0 when unknown, e.g. after a trap).
     pub mem_peak_bytes: usize,
