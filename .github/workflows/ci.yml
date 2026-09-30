@@ -32,7 +32,7 @@ jobs:
       # local run, those tests just skip themselves.
       WARPLINE_TEST_DATABASE_URL: postgres://warpline:warpline@localhost:5432/warpline_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -52,7 +52,7 @@ jobs:
     name: cargo check (MSRV)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
@@ -73,7 +73,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -86,7 +86,7 @@ jobs:
     name: cargo package (publish readiness)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Builds each crate from its packaged tarball, catching files read
@@ -100,7 +100,7 @@ jobs:
     continue-on-error: true
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run
@@ -110,7 +110,7 @@ jobs:
     name: build guests (wasm32-wasip2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned guest toolchain (examples/rust-toolchain.toml)
         working-directory: examples
         run: rustup toolchain install
@@ -148,7 +148,7 @@ jobs:
     env:
       WARPLINE_TEST_DATABASE_URL: postgres://storefront:storefront@localhost:5432/storefront
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain (examples/rust-toolchain.toml)
         working-directory: examples
         run: rustup toolchain install
