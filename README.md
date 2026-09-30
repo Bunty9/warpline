@@ -19,33 +19,42 @@
 ## Embedding warpline in your app
 
 `warpline-core` is a library: hold a `Runtime`, publish components under
-`(tenant, function)` names and invoke them. The same example runs as a
-doctest in [`crates/core/src/runtime.rs`](crates/core/src/runtime.rs). Its
-`# ` scaffolding lines (a `main` and a tempdir) are shown here as real code:
+`(tenant, function)` names and invoke them. Add the dependencies:
+
+```toml
+[dependencies]
+warpline-core = "0.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+tempfile = "3"   # only for the scratch registry directory below
+```
 
 ```rust
 use std::sync::Arc;
 use warpline_core::{Bytes, Limits, MemKv, Runtime, RuntimeConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let runtime = Runtime::builder(RuntimeConfig::new(dir.path()))
         .kv(Arc::new(MemKv::new()))
         .build()?;
 
-    // A component implementing the `handler` world (see `wit/warpline.wit`);
-    // this one, from the test suite, echoes its input.
-    let wasm = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_guest.wasm"));
-    runtime.publish("acme", "hello", Bytes::from_static(wasm)).await?;
+    // A built guest component (see `examples/hello-wasm` for how to build one).
+    let wasm = std::fs::read("hello_wasm.wasm")?;
+    runtime.publish("acme", "hello", Bytes::from(wasm)).await?;
 
     let limits = Limits::new(50, 32 << 20)?;
-    let out = runtime.invoke("acme", "hello", b"hi".to_vec(), &limits).await?;
-    assert_eq!(out.output, b"hi");
+    let out = runtime.invoke("acme", "hello", Vec::new(), &limits).await?;
+    assert_eq!(out.output, b"hello from wasm");
     println!("{} bytes back, {} us cpu", out.output.len(), out.usage.cpu_us);
     Ok(())
 }
 ```
+
+The doctest on `Runtime` in
+[`crates/core/src/runtime.rs`](crates/core/src/runtime.rs) is the same flow
+against the echo fixture from this repo's test suite.
 
 `invoke` never queues: a tenant over its in-flight cap gets `TenantBusy`
 (429) and an invocation the memory budget cannot admit gets `Overloaded`
@@ -122,8 +131,8 @@ imports/exports against the `warpline:host/handler` world, and only then
 persists the source bytes + compiled `.cwasm`. It then takes a per-tenant
 advisory lock in a Postgres transaction, checks the function quota, upserts
 the `functions` row, and calls `Runtime::activate` to write the
-`(tenant, func) -> digest` pointer file *before* committing (restoring the
-previous pointer if the commit fails). `warpline-host` calls
+`(tenant, func) -> digest` pointer file *before* committing (and, if the commit fails, re-pointing it at whatever the `functions` row says,
+under the lock again). `warpline-host` calls
 `Runtime::invoke`, which reads the pointer, resolves the digest through an
 in-memory LRU backed by the shared `cwasm/` directory, and calls the
 component's `handle` export inside a fresh `wasmtime::Store` with per-tenant
@@ -179,7 +188,7 @@ defaults shown.
 | `http-out` private/loopback/link-local targets  | blocked unless `WARPLINE_ALLOW_PRIVATE_EGRESS=1`  | `is_blocked_ip`, `GuardedResolver` |
 | Upload body (`.wasm`)                           | 16 MiB                                            | `UPLOAD_BODY_LIMIT_BYTES` |
 | Invoke request body                             | 1 MiB                                             | `INVOKE_BODY_LIMIT_BYTES` |
-| Functions per tenant                            | 100                                               | `DEFAULT_MAX_FUNCTIONS_PER_TENANT` (`warpline-control`), enforced in the publish transaction |
+| Functions per tenant                            | 100                                               | `DEFAULT_MAX_FUNCTIONS_PER_TENANT` (`warpline-control`), enforced in the publish transaction, so **only with Postgres** (`WARPLINE_INSECURE_DEV=1` has no quota) |
 | Compile concurrency (process-wide)              | `max(available_parallelism / 2, 1)` permits       | `RuntimeConfig::compile_concurrency` |
 | In-memory component cache                       | 256 entries, 512 MiB total serialized bytes       | `RuntimeConfig::component_cache_entries` / `component_cache_bytes` |
 | Epoch tick                                      | 1 ms                                              | `sandbox::EpochTicker`, `EPOCH_TICK_MS` |
@@ -348,7 +357,7 @@ embedding library reads none):
 | `WARPLINE_EMBED_CONTROL`        | host             | unset                                                    | Set to `1` to also serve the control-plane API from the host process (same engine, same volume), and run the startup blob GC there. Needs the `embed-control` cargo feature (on by default; ignored with a warning without it). Used by `fly.toml`, since a Fly volume attaches to one machine. |
 | `RUST_LOG`                      | host, control    | `info`                                                   | `tracing` filter directive; logs are JSON. |
 | `WARPLINE_ALLOW_PRIVATE_EGRESS` | host             | unset (`false`)                                          | Set to `1` to let `http-out` reach loopback/private/link-local addresses (local dev only). |
-| `WARPLINE_TEST_DATABASE_URL`    | tests only       | unset (DB-backed tests skip themselves)                  | Postgres URL for `crates/core/tests/pg.rs` and `crates/{host,control}/tests/db_mode.rs`. |
+| `WARPLINE_TEST_DATABASE_URL`    | tests only       | unset or empty (DB-backed tests skip themselves)                | Postgres URL for `crates/core/tests/pg.rs` and `crates/{host,control}/tests/db_mode.rs`. |
 
 An environment variable that is set but empty counts as unset. The binaries
 are the only place that reads the environment; `warpline-core` never does.
@@ -366,7 +375,7 @@ are the only place that reads the environment; `warpline-core` never does.
   - `400` invalid tenant/func name, missing `wasm` field, malformed
     multipart.
   - `401` no/invalid bearer token. `403` token belongs to a different
-    tenant, or the tenant's function quota (100) is exceeded.
+    tenant, or the tenant's function quota (100, Postgres mode only) is exceeded.
   - `413` body over 16 MiB.
   - `422` not a valid component, or it fails typecheck against the
     `warpline:host/handler` world (missing export or unsatisfiable
@@ -473,7 +482,7 @@ Most of the test suite runs with no external dependencies (dev mode without
 a database, in-memory `MemKv`, tempdir module registries). A second tier of
 DB-backed tests (`crates/core/tests/pg.rs`,
 `crates/{host,control}/tests/db_mode.rs`) only runs when
-`WARPLINE_TEST_DATABASE_URL` is set — they cover the admin route, API-key
+`WARPLINE_TEST_DATABASE_URL` is set and non-empty — they cover the admin route, API-key
 auth, tenant limits, metering, and the per-tenant function quota against
 a real Postgres:
 
@@ -525,8 +534,8 @@ warpline/
 Out of scope for the current runtime, tracked for a later phase:
 
 - **S3/MinIO-backed `.cwasm` registry** — the shared local volume covers a
-  one-box deploy; a multi-host deploy needs a real object store behind the
-  same `registry` trait boundary.
+  one-box deploy; a multi-host deploy needs a real object store in place of
+  the registry's local-filesystem functions (there is no trait for it yet).
 - **Instance pooling / warm-store reuse** (wasmtime's pooling allocator) —
   every invoke currently builds a fresh `Store`.
 - **Single-flight dedupe on a cold digest** — a burst of concurrent

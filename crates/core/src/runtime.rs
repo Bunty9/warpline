@@ -354,6 +354,30 @@ impl Runtime {
         .map_err(|e| Error::Internal(format!("deactivate task failed: {e}")))?
     }
 
+    /// Point `(tenant, func)` at a component that was staged earlier, given
+    /// only its digest (e.g. read back from a database row). Errors if no
+    /// source blob for `digest` exists.
+    pub async fn activate_digest(
+        &self,
+        tenant: &str,
+        func: &str,
+        digest: &str,
+    ) -> Result<(), PublishError> {
+        if !registry::wasm_exists(&self.0.cfg.modules_dir, digest) {
+            return Err(PublishError::Registry(Error::Corrupt(format!(
+                "no staged component with digest {digest}"
+            ))));
+        }
+        self.activate(
+            tenant,
+            func,
+            &Staged {
+                digest: digest.to_owned(),
+            },
+        )
+        .await
+    }
+
     /// [`stage`](Self::stage) then [`activate`](Self::activate).
     pub async fn publish(
         &self,

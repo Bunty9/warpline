@@ -31,8 +31,9 @@
 //! rejects any digest that isn't exactly 64 lowercase hex characters before
 //! it ever builds a path, so a digest can't be used to escape `cache_dir`
 //! (e.g. `../../etc/passwd`) on its way to that `unsafe` call. The
-//! control-plane is the only writer to this directory and `cache_dir` is
-//! otherwise treated as trusted local storage — that's the standard
+//! control plane (on upload) and the host (when it recompiles a missing
+//! `.cwasm`) both write this directory, and `cache_dir` is otherwise
+//! treated as trusted local storage — that's the standard
 //! `cwasm` trust model (see wasmtime docs).
 
 use std::hash::{Hash, Hasher};

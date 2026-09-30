@@ -56,6 +56,11 @@ fn wasm_path(modules_dir: &Path, digest: &str) -> PathBuf {
     wasm_dir(modules_dir).join(format!("{digest}.wasm"))
 }
 
+/// Whether the source `.wasm` for `digest` is on disk.
+pub(crate) fn wasm_exists(modules_dir: &Path, digest: &str) -> bool {
+    cache::is_valid_digest(digest) && wasm_path(modules_dir, digest).is_file()
+}
+
 fn pointer_path(modules_dir: &Path, tenant: &str, func: &str) -> Option<PathBuf> {
     if !valid_name(tenant) || !valid_name(func) {
         return None;

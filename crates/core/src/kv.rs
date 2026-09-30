@@ -3,7 +3,7 @@
 //! The trait is intentionally tiny — `get` / `put`, no batch, no scan — so
 //! that any of the downstream candidate backends (in-process [`MemKv`], the
 //! P5 `driftdb` LSM, Redis, S3) drop in behind the same surface. Tenant
-//! scoping is a constructor argument on every call — `(tenant, key)` is the
+//! scoping is a method parameter on every call — `(tenant, key)` is the
 //! real key — rather than a host-side string prefix: concatenating
 //! `"{tenant}/{key}"` let tenant `a` key `b/x` collide with tenant `a/b` key
 //! `x`. A backend that stores by the `(tenant, key)` pair (or an
@@ -60,7 +60,7 @@ pub trait KvStore: Send + Sync {
 #[derive(Default)]
 struct MemKvInner {
     entries: HashMap<(String, String), Vec<u8>>,
-    /// Running total of value bytes stored per tenant — kept in the same
+    /// Running total of key + value + per-entry overhead bytes stored per tenant — kept in the same
     /// lock as `entries` so a put's quota check and its write are atomic.
     tenant_bytes: HashMap<String, usize>,
 }

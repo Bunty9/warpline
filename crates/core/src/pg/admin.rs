@@ -119,7 +119,13 @@ pub async fn patch_tenant(
     let (hosts, cpu, mem) = cols(&checked);
     let mut tx = pool.begin().await?;
     let tenant_id: sqlx::types::Uuid = sqlx::query_scalar(
-        "INSERT INTO warpline.tenants (name, allowed_hosts, cpu_budget_ms, mem_cap_bytes)          VALUES ($1, $2, $3, $4)          ON CONFLICT (name) DO UPDATE SET             allowed_hosts = CASE WHEN $5 THEN EXCLUDED.allowed_hosts ELSE tenants.allowed_hosts END,             cpu_budget_ms = CASE WHEN $6 THEN EXCLUDED.cpu_budget_ms ELSE tenants.cpu_budget_ms END,             mem_cap_bytes = CASE WHEN $7 THEN EXCLUDED.mem_cap_bytes ELSE tenants.mem_cap_bytes END          RETURNING id",
+        "INSERT INTO warpline.tenants (name, allowed_hosts, cpu_budget_ms, mem_cap_bytes) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (name) DO UPDATE SET \
+            allowed_hosts = CASE WHEN $5 THEN EXCLUDED.allowed_hosts ELSE tenants.allowed_hosts END, \
+            cpu_budget_ms = CASE WHEN $6 THEN EXCLUDED.cpu_budget_ms ELSE tenants.cpu_budget_ms END, \
+            mem_cap_bytes = CASE WHEN $7 THEN EXCLUDED.mem_cap_bytes ELSE tenants.mem_cap_bytes END \
+         RETURNING id",
     )
     .bind(name)
     .bind(hosts)

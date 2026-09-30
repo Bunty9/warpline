@@ -115,8 +115,8 @@ Source of requirements: the 2026-09-30 audit; plan in
 - [x] **Task 3** — `warpline-host` and `warpline-control` are thin HTTP
       layers over `Runtime` + `pg`: environment handling only in `main.rs`
       (empty means unset), control shuts down gracefully, upload activates
-      the pointer inside the quota transaction and restores the previous one
-      if the commit fails, admin bodies have PATCH semantics, host embeds
+      the pointer inside the quota transaction and reconciles it with the
+      `functions` row if the commit fails, admin bodies have PATCH semantics, host embeds
       control behind the `embed-control` feature and awaits it with a
       timeout on shutdown, README embedding section and doc fixes.
 - [ ] **Task 4** — `examples/storefront` reference app.
@@ -133,8 +133,8 @@ items deferred out of Phase 2 (also tracked in README "Roadmap / deferred"):
       concurrent first-invokes for one freshly-uploaded function each pay
       for their own recompile today (`crates/core/src/registry.rs`,
       `ComponentCache::get_or_load`).
-- [ ] S3/MinIO-backed `.cwasm` registry, behind the same `registry` trait
-      boundary, for a multi-host deploy (the shared local volume only
+- [ ] S3/MinIO-backed `.cwasm` registry, in place of the registry's
+      local-filesystem functions, for a multi-host deploy (the shared local volume only
       covers one box).
 - [ ] Instance pooling / warm-store reuse (wasmtime's pooling allocator) —
       every invoke currently builds a fresh `Store`.

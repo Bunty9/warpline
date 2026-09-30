@@ -81,9 +81,14 @@ async fn connect_auth() -> anyhow::Result<Option<Authenticator>> {
     };
     let pool = pg::connect(&url).await?;
     pg::migrate(&pool).await?;
-    let ttl = env_nonempty("WARPLINE_AUTH_CACHE_TTL_SECS")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30);
+    let ttl = match env_nonempty("WARPLINE_AUTH_CACHE_TTL_SECS") {
+        Some(v) => v.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "WARPLINE_AUTH_CACHE_TTL_SECS must be a whole number of seconds, got {v:?}"
+            )
+        })?,
+        None => 30,
+    };
     Ok(Some(Authenticator::new(pool, Duration::from_secs(ttl))))
 }
 

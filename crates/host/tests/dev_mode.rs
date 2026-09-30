@@ -221,11 +221,30 @@ async fn overload_and_tenant_busy_map_to_503_and_429() {
     let busy = host_router_with(dir.path(), |c| c.max_in_flight_per_tenant = 1);
     let spinner = {
         let busy = busy.clone();
-        tokio::spawn(async move { invoke(&busy, "acme", "echo", b"loop").await })
+        tokio::spawn(async move {
+            // A poll below may briefly hold the slot; retry until we get it.
+            loop {
+                let res = invoke(&busy, "acme", "echo", b"loop").await;
+                if res.0 != StatusCode::TOO_MANY_REQUESTS {
+                    return res;
+                }
+            }
+        })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let (status, _) = invoke(&busy, "acme", "echo", b"x").await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // Poll until the spinner holds the slot (no fixed sleep to race on slow CI).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // A missing function: 404 while the slot is free, 429 once it is held.
+        let (status, _) = invoke(&busy, "acme", "nope", b"x").await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw 429, last status {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     let (status, _) = spinner.await.unwrap();
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
     // Slot released.

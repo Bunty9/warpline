@@ -27,6 +27,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use sqlx::PgPool;
 use warpline_core::{
     pg::{self, AdminError, AuthOutcome, Authenticator, LimitsPatch},
     types::{parse_bearer, valid_name, validate_cpu_budget_ms, validate_mem_cap_bytes},
@@ -207,12 +208,17 @@ async fn upload(
 ///
 /// The pointer is switched *inside* the transaction, before the commit, so
 /// the lock is still held: two uploads of the same `(tenant, func)` cannot
-/// interleave, and the pointer always ends up matching the last committed
-/// row. If the commit then fails, the previous pointer is put back (or
-/// removed, if there was none) by [`restore_pointer`]. A crash between
-/// activate and commit can still leave the pointer ahead of the row; the
-/// pointer is what invokes read, so the function serves the new code and the
-/// next upload repairs the row.
+/// interleave. If the commit fails, [`reconcile_pointer`] takes the lock
+/// again and points the pointer back at whatever the `functions` row says
+/// (the database is the source of truth), so it cannot clobber a concurrent
+/// upload that committed in between. A crash between activate and commit can
+/// still leave the pointer ahead of the row; the next upload repairs it.
+///
+/// The transactional part runs in its own spawned task: if the client
+/// disconnects, axum drops the handler future, and a dropped future would
+/// roll back after `activate` with nothing to restore the pointer (which
+/// would then serve code no row backs, and let timed disconnects dodge the
+/// quota). The task always runs to completion.
 ///
 /// Without a database (dev mode), there is nothing to lock or upsert
 /// against, so this just writes the pointer.
@@ -229,7 +235,7 @@ async fn publish_pointer(
             "failed to publish module".to_string(),
         )
     };
-    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
+    if state.auth.is_none() {
         return state
             .runtime
             .activate(tenant, func, staged)
@@ -237,6 +243,43 @@ async fn publish_pointer(
             .map_err(|e| pointer_error("failed to write pointer", &e));
     };
 
+    let (state, tenant, func, staged) = (
+        state.clone(),
+        tenant.to_owned(),
+        func.to_owned(),
+        staged.clone(),
+    );
+    tokio::spawn(async move { publish_in_db(&state, &tenant, &func, &staged).await })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "publish task failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            ))
+        })
+}
+
+/// The lock -> quota -> upsert -> activate -> commit section of
+/// [`publish_pointer`]; see there for why it is spawned.
+async fn publish_in_db(
+    state: &AppState,
+    tenant: &str,
+    func: &str,
+    staged: &Staged,
+) -> Result<(), (StatusCode, String)> {
+    let pool = state
+        .auth
+        .as_ref()
+        .map(Authenticator::pool)
+        .expect("only called in DB mode");
+    let pointer_error = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::error!(%tenant, %func, error = %e, "{what}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to publish module".to_string(),
+        )
+    };
     let internal_error = |e: sqlx::Error, action: &str| {
         tracing::error!(%tenant, %func, error = %e, "{action}");
         (
@@ -297,11 +340,6 @@ async fn publish_pointer(
     .await
     .map_err(|e| internal_error(e, "failed to upsert functions row"))?;
 
-    let previous = state
-        .runtime
-        .active(tenant, func)
-        .await
-        .map_err(|e| pointer_error("failed to read current pointer", &e))?;
     state
         .runtime
         .activate(tenant, func, staged)
@@ -309,35 +347,47 @@ async fn publish_pointer(
         .map_err(|e| pointer_error("failed to write pointer", &e))?;
 
     if let Err(e) = tx.commit().await {
-        restore_pointer(&state.runtime, tenant, func, previous).await;
+        reconcile_pointer(pool, &state.runtime, tenant, func).await;
         return Err(internal_error(e, "failed to commit publish transaction"));
     }
     Ok(())
 }
 
-/// Undo an [`activate`](Runtime::activate) whose transaction did not commit:
-/// point `(tenant, func)` back at `previous`, or remove the pointer if there
-/// was none. Failures are logged; there is nothing further to fall back on.
-#[doc(hidden)]
-pub async fn restore_pointer(
+/// After a failed commit: under the tenant lock, point `(tenant, func)` at
+/// the digest its `functions` row holds, or remove the pointer if there is
+/// no row. Failures are logged; there is nothing further to fall back on.
+async fn reconcile_pointer(pool: &PgPool, runtime: &Runtime, tenant: &str, func: &str) {
+    if let Err(e) = try_reconcile(pool, runtime, tenant, func).await {
+        tracing::error!(%tenant, %func, error = %e, "could not reconcile pointer with database");
+    }
+}
+
+async fn try_reconcile(
+    pool: &PgPool,
     runtime: &Runtime,
     tenant: &str,
     func: &str,
-    previous: Option<Staged>,
-) {
-    let result = match &previous {
-        Some(prev) => runtime
-            .activate(tenant, func, prev)
-            .await
-            .map_err(|e| e.to_string()),
-        None => runtime
-            .deactivate(tenant, func)
-            .await
-            .map_err(|e| e.to_string()),
-    };
-    if let Err(e) = result {
-        tracing::error!(%tenant, %func, error = %e, "could not restore previous pointer");
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await?;
+    let hash: Option<String> = sqlx::query_scalar(
+        "SELECT f.wasm_hash FROM warpline.functions f \
+         JOIN warpline.tenants t ON t.id = f.tenant_id WHERE t.name = $1 AND f.name = $2",
+    )
+    .bind(tenant)
+    .bind(func)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match hash {
+        Some(h) => runtime.activate_digest(tenant, func, &h).await?,
+        None => runtime.deactivate(tenant, func).await?,
     }
+    // Hold the lock until the pointer is settled.
+    tx.commit().await?;
+    Ok(())
 }
 
 /// `POST /admin/tenants/{tenant}` request body — every field optional, so a
@@ -438,34 +488,53 @@ async fn admin_create_tenant(
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, restore_pointer};
-    use warpline_core::{Bytes, Runtime, RuntimeConfig};
+    use super::{constant_time_eq, reconcile_pointer};
+    use warpline_core::{pg, Bytes, Runtime, RuntimeConfig};
 
     const GUEST: &[u8] = include_bytes!("../../core/tests/fixtures/test_guest.wasm");
 
-    /// The commit-failure path: the pointer goes back to what it was, or
-    /// disappears when there was none.
+    /// The commit-failure path: the pointer follows the `functions` row (the
+    /// source of truth), not whatever was activated before the failure, and
+    /// disappears when there is no row.
     #[tokio::test]
-    async fn restore_pointer_undoes_an_activate() {
+    async fn reconcile_pointer_follows_the_database() {
+        let url = std::env::var("WARPLINE_TEST_DATABASE_URL").unwrap_or_default();
+        if url.is_empty() {
+            eprintln!("skipping: WARPLINE_TEST_DATABASE_URL not set");
+            return;
+        }
+        let pool = pg::connect(&url).await.unwrap();
+        pg::migrate(&pool).await.unwrap();
+        let tenant = format!("t-recon-{}", std::process::id());
+        pg::create_tenant(&pool, &tenant, None).await.unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::new(RuntimeConfig::new(dir.path())).unwrap();
-        let first = rt
-            .publish("t", "f", Bytes::from_static(GUEST))
-            .await
-            .unwrap();
-
-        // A different component to "activate before the failed commit".
+        let committed = rt.stage(Bytes::from_static(GUEST)).await.unwrap();
+        // A different component: "activated before the failed commit".
         let mut other = GUEST.to_vec();
         other.extend_from_slice(&[0, 3, 1, b'x', 0]); // custom section: new digest
-        let second = rt.stage(Bytes::from(other)).await.unwrap();
-        assert_ne!(first, second);
+        let uncommitted = rt.stage(Bytes::from(other)).await.unwrap();
+        assert_ne!(committed, uncommitted);
 
-        rt.activate("t", "f", &second).await.unwrap();
-        restore_pointer(&rt, "t", "f", Some(first.clone())).await;
-        assert_eq!(rt.active("t", "f").await.unwrap(), Some(first));
+        // No row yet: reconcile removes the stray pointer.
+        rt.activate(&tenant, "f", &uncommitted).await.unwrap();
+        reconcile_pointer(&pool, &rt, &tenant, "f").await;
+        assert_eq!(rt.active(&tenant, "f").await.unwrap(), None);
 
-        restore_pointer(&rt, "t", "f", None).await;
-        assert_eq!(rt.active("t", "f").await.unwrap(), None);
+        // A committed row: reconcile restores exactly that digest.
+        sqlx::query(
+            "INSERT INTO warpline.functions (tenant_id, name, wasm_hash) \
+             SELECT id, 'f', $2 FROM warpline.tenants WHERE name = $1",
+        )
+        .bind(&tenant)
+        .bind(&committed.digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+        rt.activate(&tenant, "f", &uncommitted).await.unwrap();
+        reconcile_pointer(&pool, &rt, &tenant, "f").await;
+        assert_eq!(rt.active(&tenant, "f").await.unwrap(), Some(committed));
     }
 
     #[test]
