@@ -23,7 +23,8 @@ reference integration.
   admission, an output size cap (502) and cancellation-safe metering.
 - `warpline_core::pg` (cargo feature `postgres`, on by default): `migrate`,
   `connect`, `Authenticator` (per-instance auth cache), tenant admin
-  (`create_tenant`, `patch_tenant`, `tenant_limits`, `LimitsPatch`), a usage
+  (`create_tenant`, `patch_tenant`, `tenant_limits`, `LimitsPatch`; the control plane's
+  PATCH behaviour is unchanged, now a library function), a usage
   summary and a batching, retrying `PgMeter`. `Usage`, `MeterSink` and
   `Limits` live at the crate root.
 - Metric `warpline_meter_dropped_total`; `PgMeter` warns when metering
@@ -46,14 +47,10 @@ reference integration.
   `warpline_core::pg::migrate(&pool)` at startup. The host and control
   binaries do it for you.
 - **Embedding API.** `Runtime` replaces the free functions. The component
-  cache, registry, sandbox and `HostCtx` are private; only `registry::digest`
+  cache, registry, sandbox and `HostCtx` are private; only `warpline_core::digest`
   stays public. Public structs and enums that may grow are `#[non_exhaustive]`.
 - **`KvStore::get` is fallible** (returns a `Result`), so a store outage is
   no longer indistinguishable from a missing key.
-- **Admin tenant-limits update uses PATCH semantics** (control,
-  `pg::patch_tenant`): only fields present in the body change, omitted
-  fields keep their current value, and the update plus any key issuance run
-  in one transaction. Send only what you want to change.
 - **New HTTP status codes** from the invoke path: 503 (overloaded), 429
   (tenant busy) and 502 (guest output too large), in addition to the
   existing mapping. Clients that only handled the old set should treat them
@@ -97,7 +94,8 @@ reference integration.
 
 - The free-function invoke API and public access to the cache, registry and
   sandbox internals (use `Runtime`).
-- The core `auth.rs` and `meter.rs` modules (replaced by `pg`) and the
+- The core `auth.rs` module and the Postgres metering in `meter.rs` (now
+  `pg::Authenticator` and `pg::PgMeter`) and the
   process-global auth cache.
 - Unused dependencies in `warpline-host` and `warpline-control`.
 - The separate second migration (squashed into `0001_warpline.sql`).

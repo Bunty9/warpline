@@ -553,15 +553,22 @@ Out of scope for the current runtime, tracked for a later phase:
 
 ## Releasing
 
+Releases go through a PR merged to `main`, then a tag on `main`.
+
 1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and the
-   `version = "..."` of the path dependencies in `crates/*/Cargo.toml`.
-2. Move the `CHANGELOG.md` entries to a new `## [X.Y.Z] - date` section.
-3. Commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+   `version = "..."` of the path dependencies in `crates/*/Cargo.toml`, then
+   refresh `Cargo.lock` (`cargo update -w`).
+2. On a minor bump, also update `warpline-core = "0.x"` in
+   `examples/storefront/app/Cargo.toml` and in the snippet above.
+3. Move the `CHANGELOG.md` entries to a new `## [X.Y.Z] - date` section and
+   update the compare links at the bottom.
+4. Merge the PR, then `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
 
 The `release` workflow checks that the tag matches the version, runs
-`cargo package --workspace`, publishes to crates.io through trusted
-publishing (no stored token) and creates the GitHub release from the
-changelog section. See `docs/plans/2026-09-28-publishing.md`.
+`cargo package --workspace --locked`, publishes the crates not yet on
+crates.io through trusted publishing (no stored token; safe to re-run after a
+partial failure) and creates the GitHub release from the changelog section.
+See `docs/plans/2026-09-28-publishing.md`.
 
 ## License <a id="license"></a>
 

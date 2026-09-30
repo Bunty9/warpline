@@ -190,9 +190,11 @@ jobs:
           ./target/release/fraud-mock > "$RUNNER_TEMP/fraud.log" 2>&1 &
           ./target/release/storefront > "$RUNNER_TEMP/storefront.log" 2>&1 &
           trap 'echo "--- fraud-mock"; cat "$RUNNER_TEMP/fraud.log"; echo "--- storefront"; cat "$RUNNER_TEMP/storefront.log"' EXIT
-          for _ in $(seq 60); do
-            curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1 && break
-            sleep 1
+          for url in http://127.0.0.1:3100/ http://127.0.0.1:3000/healthz; do
+            for _ in $(seq 60); do
+              curl -sS -o /dev/null "$url" 2>/dev/null && break
+              sleep 1
+            done
+            curl -sS -o /dev/null "$url"
           done
-          curl -fsS http://127.0.0.1:3000/healthz
           FRAUD_HOST=127.0.0.1 ../demo.sh

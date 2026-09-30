@@ -31,7 +31,7 @@ All four names (`warpline`, `warpline-core`, `warpline-host`,
   `sqlx::migrate!` read them at compile time, and a crates.io tarball only
   contains the crate's own directory. Migration checksums are
   content-based, so existing databases are unaffected by the move.
-- Path dependencies carry `version = "0.1.0"`, so they resolve from the
+- Path dependencies carry the workspace version (`version = "X.Y.Z"`), so they resolve from the
   registry once published.
 - No `sqlx::query!` macros, so docs.rs builds need neither a database nor
   offline query data.
@@ -50,12 +50,12 @@ repository `Bunty9/warpline`, workflow `release.yml`, environment `release`
    `version = "..."` entries in `crates/*/Cargo.toml` together.
 3. Add a `## [X.Y.Z] - date` section to `CHANGELOG.md` (it becomes the
    GitHub release notes).
-4. Commit, merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. Release via a PR merged to `main`, then tag `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 5. The workflow: verifies tag == workspace version, extracts the changelog
-   section, runs `cargo package --workspace`, exchanges the job's OIDC token
+   section, runs `cargo package --workspace --locked`, exchanges the job's OIDC token
    for a short-lived crates.io token (`rust-lang/crates-io-auth-action`, revoked
-   in its post step), runs `cargo publish --workspace` (orders and waits for
-   indexing; needs cargo >= 1.90) and creates the GitHub release.
+   in its post step), publishes only the crates not yet on crates.io, in dependency order
+   (`cargo publish -p`, so a failed run can simply be re-run) and creates the GitHub release.
 6. Confirm the docs.rs builds succeeded.
 
 Publishing is permanent: a version can be yanked but never deleted or
@@ -82,8 +82,7 @@ publish step then fails harmlessly on the already-published version.)
 - **Reserve `warpline`?** A tiny facade crate re-exporting
   `warpline-core` would hold the short name. Not done — a placeholder
   crate is squatting-adjacent; publish it only with real content.
-- **Should `warpline-host` depend on `warpline-control` unconditionally?**
-  It does today, for `WARPLINE_EMBED_CONTROL`. A cargo feature (default on)
-  would let library users of `warpline_host` skip it. Low priority.
+- ~~Should `warpline-host` depend on `warpline-control` unconditionally?~~
+  Done in 0.2.0: the `embed-control` cargo feature (default on).
 - **Owners.** Add a second crates.io owner (a GitHub team) if the project
   gains maintainers, so the crates can't be orphaned.
