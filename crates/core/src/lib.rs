@@ -14,10 +14,10 @@
 //! - [`pg`] (feature `postgres`, on by default) — schema-isolated migrations,
 //!   bearer-token auth, tenant admin and a batching [`MeterSink`]. Nothing in
 //!   this crate reads environment variables or migrates implicitly.
+//! - [`types`] — [`Limits`], name validation and config validators.
 //!
 //! For a complete integration (an axum app, a Rust guest, Postgres auth and
 //! metering) see [`examples/storefront`](https://github.com/Bunty9/warpline/tree/main/examples/storefront).
-//! - [`types`] — [`Limits`], name validation and config validators.
 
 #![warn(missing_debug_implementations)]
 

@@ -181,6 +181,8 @@ struct Inner {
 /// Publish a component under `(tenant, function)`, then invoke it with
 /// per-call [`Limits`]. Cheap to clone; clones share all state.
 ///
+/// Guests implement the [`handler` world](https://github.com/Bunty9/warpline/blob/main/crates/core/wit/warpline.wit).
+///
 /// ```
 /// use std::sync::Arc;
 /// use warpline_core::{Bytes, Limits, MemKv, Runtime, RuntimeConfig};
@@ -192,8 +194,6 @@ struct Inner {
 ///     .kv(Arc::new(MemKv::new()))
 ///     .build()?;
 ///
-/// // A component implementing the `handler` world (see the
-/// // [WIT file](https://github.com/Bunty9/warpline/blob/main/crates/core/wit/warpline.wit)).
 /// // Build one with any component toolchain, e.g. a Rust guest with
 /// // `cargo build --target wasm32-wasip2 --release`; `examples/storefront`
 /// // has a complete one. The doctest uses an echo guest from the test suite.
@@ -444,9 +444,9 @@ impl Runtime {
         if !valid_name(tenant) || !valid_name(func) {
             return Err(InvokeError::InvalidName);
         }
+        validate_limits(limits)?;
         // Held for the whole call: keeps the ticker alive even if every
         // other `Runtime` handle is dropped meanwhile.
-        validate_limits(limits)?;
         let inner = self.0.clone();
 
         let _slot = TenantSlot::acquire(&inner, tenant).ok_or(InvokeError::TenantBusy)?;

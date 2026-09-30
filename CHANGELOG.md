@@ -14,7 +14,7 @@ reference integration.
 ### Added
 
 - `warpline_core::Runtime` (with `RuntimeConfig` and `RuntimeBuilder`):
-  `stage`, `activate`, `deactivate`, `active`, `publish`, `invoke` and `gc`
+  `stage`, `activate`, `activate_digest`, `deactivate`, `active`, `publish`, `invoke` and `gc`
   behind one cheap-to-clone handle that owns the component cache and epoch
   ticker. Typed `InvokeError`, `PublishError` and `Error`; `InvokeError`
   has `http_status()`.
@@ -54,8 +54,6 @@ reference integration.
 - **Embedding API.** `Runtime` replaces the free functions. The component
   cache, registry, sandbox and `HostCtx` are private; only `warpline_core::digest`
   stays public. Public structs and enums that may grow are `#[non_exhaustive]`.
-- **`Runtime::active` and `deactivate`** return `PublishError` and reject
-  invalid names, like `activate`.
 - **`KvStore::get` is fallible** (returns a `Result`), so a store outage is
   no longer indistinguishable from a missing key.
 - **New HTTP status codes** from the invoke path: 503 (overloaded), 429

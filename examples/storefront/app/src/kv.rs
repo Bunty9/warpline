@@ -36,16 +36,23 @@ impl PgKv {
     /// Create the table (idempotent). The app owns this schema, so it is
     /// created here rather than by `warpline_core::pg::migrate`.
     pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        // Concurrent replicas or tests on a fresh DB: both could race on
+        // CREATE SCHEMA, so take a transaction-scoped advisory lock first.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('storefront.migrate'))")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("CREATE SCHEMA IF NOT EXISTS storefront")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS storefront.hook_kv (\
                 tenant text NOT NULL, key text NOT NULL, value bytea NOT NULL, \
                 PRIMARY KEY (tenant, key))",
         )
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 }
