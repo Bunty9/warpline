@@ -841,3 +841,37 @@ async fn activate_digest_validates_names_digest_and_blob() {
         .unwrap();
     assert_eq!(rt.active("tenant-a", FN).await.unwrap(), Some(staged));
 }
+
+#[tokio::test]
+async fn out_of_range_limits_are_rejected_not_panicked_on() {
+    let (rt, _dir) = setup_with(&["tenant-a"], |_| {}).await;
+    let mut l = limits(100);
+    l.cpu_budget_ms = u64::MAX;
+    let err = rt
+        .invoke("tenant-a", FN, b"{}".to_vec(), &l)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, InvokeError::InvalidLimits(_)), "{err}");
+    assert_eq!(err.http_status(), 400);
+
+    let mut l = limits(100);
+    l.mem_cap_bytes = usize::MAX;
+    let err = rt
+        .invoke("tenant-a", FN, b"{}".to_vec(), &l)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, InvokeError::InvalidLimits(_)), "{err}");
+}
+
+#[tokio::test]
+async fn active_and_deactivate_reject_invalid_names_like_activate() {
+    let (rt, _dir) = setup_with(&[], |_| {}).await;
+    assert!(matches!(
+        rt.active("Bad Name", FN).await,
+        Err(PublishError::InvalidName)
+    ));
+    assert!(matches!(
+        rt.deactivate("tenant-a", "../x").await,
+        Err(PublishError::InvalidName)
+    ));
+}

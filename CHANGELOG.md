@@ -16,16 +16,21 @@ reference integration.
 - `warpline_core::Runtime` (with `RuntimeConfig` and `RuntimeBuilder`):
   `stage`, `activate`, `deactivate`, `active`, `publish`, `invoke` and `gc`
   behind one cheap-to-clone handle that owns the component cache and epoch
-  ticker. Typed `InvokeError`, `PublishError` and `Error`, each with
-  `http_status()`.
-- Admission control: a global in-flight limit (503 when overloaded), a
-  per-tenant limit (429 when the tenant is busy), memory-weighted
-  admission, an output size cap (502) and cancellation-safe metering.
+  ticker. Typed `InvokeError`, `PublishError` and `Error`; `InvokeError`
+  has `http_status()`.
+- Admission control: a memory-weighted admission budget (503 when it cannot
+  admit an invocation), a per-tenant in-flight limit (429 when the tenant is
+  busy), an output size cap (502) and cancellation-safe metering.
+  `Runtime::invoke` re-validates the limits it is given
+  (`InvokeError::InvalidLimits`, 400).
 - `warpline_core::pg` (cargo feature `postgres`, on by default): `migrate`,
   `connect`, `Authenticator` (per-instance auth cache), tenant admin
   (`create_tenant`, `patch_tenant`, `tenant_limits`, `LimitsPatch`; the control plane's
   PATCH behaviour is unchanged, now a library function), a usage
-  summary and a batching, retrying `PgMeter`. `Usage`, `MeterSink` and
+  summary and a batching, retrying `PgMeter`. Auth lookups time out after
+  2 s; if Postgres is down, cached entries are served stale for up to
+  `max(10 x TTL, 5 min)`, otherwise the lookup fails (host and control
+  answer 503). `Usage`, `MeterSink` and
   `Limits` live at the crate root.
 - Metric `warpline_meter_dropped_total`; `PgMeter` warns when metering
   events are dropped.
@@ -49,6 +54,8 @@ reference integration.
 - **Embedding API.** `Runtime` replaces the free functions. The component
   cache, registry, sandbox and `HostCtx` are private; only `warpline_core::digest`
   stays public. Public structs and enums that may grow are `#[non_exhaustive]`.
+- **`Runtime::active` and `deactivate`** return `PublishError` and reject
+  invalid names, like `activate`.
 - **`KvStore::get` is fallible** (returns a `Result`), so a store outage is
   no longer indistinguishable from a missing key.
 - **New HTTP status codes** from the invoke path: 503 (overloaded), 429

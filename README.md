@@ -381,6 +381,7 @@ are the only place that reads the environment; `warpline-core` never does.
   - `401` no/invalid bearer token. `403` token belongs to a different
     tenant, or the tenant's function quota (100, Postgres mode only) is exceeded.
   - `413` body over 16 MiB.
+  - `503` the auth database is unreachable and no cached entry can cover.
   - `422` not a valid component, or it fails typecheck against the
     `warpline:host/handler` world (missing export or unsatisfiable
     import).
@@ -412,7 +413,8 @@ are the only place that reads the environment; `warpline-core` never does.
   - `429` the tenant already has its maximum invocations in flight.
   - `500` guest trap, failed to instantiate, or an internal error.
   - `502` the guest returned more than the output cap (8 MiB).
-  - `503` the host's memory admission budget is full; retry shortly.
+  - `503` the host's memory admission budget is full, or the auth database
+    is unreachable (and no cached entry can cover); retry shortly.
   - `507` memory cap exceeded.
 - **`GET /healthz`** — `200 ok`.
 - **`GET /metrics`** — on `WARPLINE_METRICS_BIND` (default

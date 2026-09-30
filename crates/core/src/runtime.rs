@@ -133,7 +133,7 @@ impl RuntimeBuilder {
             cfg.component_cache_entries,
             cfg.component_cache_bytes,
         );
-        let ticker = EpochTicker::spawn(engine.clone());
+        let ticker = EpochTicker::spawn(engine.clone())?;
         Ok(Runtime(Arc::new(Inner {
             admission: Arc::new(Semaphore::new(cfg.memory_budget_bytes / MIB)),
             compile_slots: Arc::new(Semaphore::new(cfg.compile_concurrency)),
@@ -192,10 +192,15 @@ struct Inner {
 ///     .kv(Arc::new(MemKv::new()))
 ///     .build()?;
 ///
-/// // A component implementing the `handler` world (see `wit/warpline.wit`);
-/// // this one, from the test suite, echoes its input.
-/// let wasm = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_guest.wasm"));
-/// runtime.publish("acme", "hello", Bytes::from_static(wasm)).await?;
+/// // A component implementing the `handler` world (see the
+/// // [WIT file](https://github.com/Bunty9/warpline/blob/main/crates/core/wit/warpline.wit)).
+/// // Build one with any component toolchain, e.g. a Rust guest with
+/// // `cargo build --target wasm32-wasip2 --release`; `examples/storefront`
+/// // has a complete one. The doctest uses an echo guest from the test suite.
+/// # #[cfg(any())]
+/// let wasm = std::fs::read("hello_wasm.wasm")?;
+/// # let wasm = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_guest.wasm")).to_vec();
+/// runtime.publish("acme", "hello", Bytes::from(wasm)).await?;
 ///
 /// let limits = Limits::new(50, 32 << 20)?;
 /// let out = runtime.invoke("acme", "hello", b"hi".to_vec(), &limits).await?;
@@ -330,28 +335,38 @@ impl Runtime {
     /// caller that activates inside its own transaction remember what to
     /// [`activate`](Self::activate) again (or [`deactivate`](Self::deactivate)
     /// if `None`) when the transaction fails to commit.
-    pub async fn active(&self, tenant: &str, func: &str) -> Result<Option<Staged>, Error> {
+    pub async fn active(&self, tenant: &str, func: &str) -> Result<Option<Staged>, PublishError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(PublishError::InvalidName);
+        }
         let inner = self.0.clone();
         let (tenant, func) = (tenant.to_owned(), func.to_owned());
         let digest = tokio::task::spawn_blocking(move || {
             registry::read_pointer(&inner.cfg.modules_dir, &tenant, &func)
         })
         .await
-        .map_err(|e| Error::Internal(format!("active task failed: {e}")))??;
+        .map_err(|e| PublishError::Registry(Error::Internal(format!("active task failed: {e}"))))?
+        .map_err(into_publish_err)?;
         Ok(digest.map(|digest| Staged { digest }))
     }
 
     /// Remove the `(tenant, func)` pointer, so invocations get
     /// [`NotFound`](InvokeError::NotFound). Idempotent. The blobs stay until
     /// [`gc`](Self::gc) collects them.
-    pub async fn deactivate(&self, tenant: &str, func: &str) -> Result<(), Error> {
+    pub async fn deactivate(&self, tenant: &str, func: &str) -> Result<(), PublishError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(PublishError::InvalidName);
+        }
         let inner = self.0.clone();
         let (tenant, func) = (tenant.to_owned(), func.to_owned());
         tokio::task::spawn_blocking(move || {
             registry::remove_pointer(&inner.cfg.modules_dir, &tenant, &func)
         })
         .await
-        .map_err(|e| Error::Internal(format!("deactivate task failed: {e}")))?
+        .map_err(|e| {
+            PublishError::Registry(Error::Internal(format!("deactivate task failed: {e}")))
+        })?
+        .map_err(into_publish_err)
     }
 
     /// Point `(tenant, func)` at a component that was staged earlier, given
@@ -406,6 +421,7 @@ impl Runtime {
     /// Run `(tenant, func)` on `input` under `limits`.
     ///
     /// Fails fast, in this order: [`InvalidName`](InvokeError::InvalidName),
+    /// [`InvalidLimits`](InvokeError::InvalidLimits),
     /// [`TenantBusy`](InvokeError::TenantBusy),
     /// [`Overloaded`](InvokeError::Overloaded),
     /// [`NotFound`](InvokeError::NotFound). Once the guest has started, the
@@ -430,6 +446,7 @@ impl Runtime {
         }
         // Held for the whole call: keeps the ticker alive even if every
         // other `Runtime` handle is dropped meanwhile.
+        validate_limits(limits)?;
         let inner = self.0.clone();
 
         let _slot = TenantSlot::acquire(&inner, tenant).ok_or(InvokeError::TenantBusy)?;
@@ -573,6 +590,14 @@ impl std::fmt::Debug for Runtime {
             .field("modules_dir", &self.0.cfg.modules_dir)
             .finish_non_exhaustive()
     }
+}
+
+/// Re-check what `Limits::new` enforces; the fields are public, so a caller
+/// may have mutated them out of range since.
+fn validate_limits(l: &Limits) -> Result<(), crate::ConfigError> {
+    use crate::types::{validate_cpu_budget_ms, validate_mem_cap_bytes};
+    validate_cpu_budget_ms(i64::try_from(l.cpu_budget_ms).unwrap_or(i64::MAX))?;
+    validate_mem_cap_bytes(i64::try_from(l.mem_cap_bytes).unwrap_or(i64::MAX))
 }
 
 fn into_publish_err(e: Error) -> PublishError {

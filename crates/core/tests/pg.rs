@@ -312,3 +312,51 @@ async fn full_channel_counts_drops() {
     assert!(meter.dropped() > 0);
     handle.shutdown(Duration::from_secs(10)).await;
 }
+
+#[tokio::test]
+async fn auth_serves_stale_entries_when_the_database_is_down() {
+    let pool = pool_or_skip!();
+    let name = unique_tenant("stale");
+    let key = pg::create_tenant(&pool, &name, None).await.unwrap().api_key;
+    let auth = Authenticator::new(pool.clone(), Duration::from_millis(50));
+    let default = AuthOutcome::Authorized(Limits::default());
+
+    // Warm the cache with a valid key and an unknown one.
+    assert_eq!(auth.authenticate(&name, Some(&key)).await.unwrap(), default);
+    assert_eq!(
+        auth.authenticate(&name, Some("wl_unknown")).await.unwrap(),
+        AuthOutcome::MissingOrUnknownKey
+    );
+
+    // Postgres goes away (a closed pool fails every query), and the TTL lapses.
+    pool.close().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Both the positive and the negative entry are served stale.
+    assert_eq!(auth.authenticate(&name, Some(&key)).await.unwrap(), default);
+    assert_eq!(
+        auth.authenticate(&name, Some("wl_unknown")).await.unwrap(),
+        AuthOutcome::MissingOrUnknownKey
+    );
+    // A key never seen has nothing to fall back on: the DB error surfaces.
+    assert!(auth
+        .authenticate(&name, Some("wl_never_seen"))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn negative_cache_hits_do_not_query() {
+    let pool = pool_or_skip!();
+    let auth = Authenticator::new(pool.clone(), Duration::from_secs(30));
+    assert_eq!(
+        auth.authenticate("x", Some("wl_bogus")).await.unwrap(),
+        AuthOutcome::MissingOrUnknownKey
+    );
+    // Within the TTL the answer comes from the cache even with no database.
+    pool.close().await;
+    assert_eq!(
+        auth.authenticate("x", Some("wl_bogus")).await.unwrap(),
+        AuthOutcome::MissingOrUnknownKey
+    );
+}

@@ -119,6 +119,7 @@ policy per result:
 | valid decision | applies it | |
 | `NotFound` (no hook uploaded) | approve, no discount | a new merchant can sell before writing code |
 | `CpuBudgetExceeded`, `MemoryCapExceeded`, `WallClockTimeout`, `GuestTrap`, `OutputTooLarge`, `Load`, invalid output | fail open: approve, no discount, log a warning | a broken hook should not cost the merchant a sale |
+| the merchant's limits could not be read from the database | fail open, as above | same reason; an unknown merchant is still a 404 |
 | `Overloaded`, `TenantBusy` | 503 with `Retry-After: 1` | capacity, not the merchant's fault; retry helps |
 
 Fail-closed is one line away in `checkout` if your domain needs it (a

@@ -39,9 +39,11 @@ pub const MAX_MEM_CAP_BYTES: i64 = 512 * 1024 * 1024;
 /// Max `allowed_hosts` entries a tenant config may set.
 pub const MAX_ALLOWED_HOSTS: usize = 64;
 
-/// A tenant config value submitted to `warpline-control`'s admin route
-/// failed validation.
+/// A tenant limit or allowlist value failed validation (from
+/// [`Limits::new`], [`Limits::with_allowed_hosts`] and the tenant admin
+/// functions).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("cpu_budget_ms must be between {MIN_CPU_BUDGET_MS} and {MAX_CPU_BUDGET_MS}")]
     CpuBudgetRange,
@@ -98,9 +100,13 @@ pub fn validate_allowed_hosts(hosts: &[String]) -> Result<Vec<String>, ConfigErr
 }
 
 /// Per-tenant resource limits: CPU budget, memory cap and the outbound-HTTP
-/// host allowlist. Fields are public to read; build one through
-/// [`Limits::new`] / [`Limits::with_allowed_hosts`] so the ranges above are
-/// enforced.
+/// host allowlist. Build one through [`Limits::new`] /
+/// [`Limits::with_allowed_hosts`] so the ranges above are enforced. The
+/// fields are public and can be mutated afterwards, which bypasses that
+/// validation; [`Runtime::invoke`](crate::Runtime::invoke) re-checks the CPU
+/// and memory values and returns
+/// [`InvokeError::InvalidLimits`](crate::InvokeError::InvalidLimits) for
+/// out-of-range ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {

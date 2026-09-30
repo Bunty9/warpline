@@ -202,7 +202,7 @@ pub async fn usage_summary(
     pool: &PgPool,
     tenant: &str,
     since: DateTime<Utc>,
-) -> Result<UsageSummary, sqlx::Error> {
+) -> Result<UsageSummary, AdminError> {
     let (invocations, errors, cpu_us, wall_us, max_mem_peak_bytes): (i64, i64, i64, i64, i64) =
         sqlx::query_as(
             "SELECT count(*), count(*) FILTER (WHERE NOT ok), \

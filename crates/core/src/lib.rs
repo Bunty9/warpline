@@ -11,9 +11,12 @@
 //! - [`runtime`] — the [`Runtime`] facade, its config and builder.
 //! - [`kv`] — the [`KvStore`] trait and the in-memory [`MemKv`].
 //! - [`meter`] — [`Usage`] and the [`MeterSink`] trait.
-//! - `pg` (feature `postgres`, on by default) — schema-isolated migrations,
+//! - [`pg`] (feature `postgres`, on by default) — schema-isolated migrations,
 //!   bearer-token auth, tenant admin and a batching [`MeterSink`]. Nothing in
 //!   this crate reads environment variables or migrates implicitly.
+//!
+//! For a complete integration (an axum app, a Rust guest, Postgres auth and
+//! metering) see [`examples/storefront`](https://github.com/Bunty9/warpline/tree/main/examples/storefront).
 //! - [`types`] — [`Limits`], name validation and config validators.
 
 #![warn(missing_debug_implementations)]

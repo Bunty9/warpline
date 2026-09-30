@@ -8,6 +8,9 @@
 //! bytes. Also serves
 //! `/healthz` and a Prometheus `/metrics` scrape endpoint.
 //!
+//! This library exists to serve the `warpline-host` binary and its tests; its
+//! API is not covered by semver guarantees beyond the binary's behaviour.
+//!
 //! Split into this lib (state + [`router`]) and a thin `main.rs` so
 //! `crates/host/tests/` can drive the whole app through
 //! `tower::ServiceExt::oneshot` without a real listening socket.
@@ -152,7 +155,11 @@ async fn invoke_handler(
         Ok(_) => return (StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth lookup failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "auth error".to_string()).into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth unavailable".to_string(),
+            )
+                .into_response();
         }
     };
 

@@ -62,6 +62,10 @@ pub enum InvokeError {
     InvalidName,
     #[error("no module published for this function")]
     NotFound,
+    /// `limits.cpu_budget_ms` or `limits.mem_cap_bytes` is outside the valid
+    /// range (possible only if the fields were mutated after `Limits::new`).
+    #[error("invalid limits: {0}")]
+    InvalidLimits(#[from] crate::ConfigError),
     /// The host's memory budget cannot admit this invocation right now (or
     /// the tenant's memory cap alone exceeds the whole budget).
     #[error("host is at capacity")]
@@ -102,12 +106,12 @@ impl InvokeError {
         }
     }
 
-    /// A suitable HTTP status code: 400 invalid name, 404 not found, 503
+    /// A suitable HTTP status code: 400 invalid name / invalid limits, 404 not found, 503
     /// overloaded, 429 tenant busy, 408 cpu budget / wall clock, 507 memory
     /// cap, 502 output too large, 500 guest trap / load failure.
     pub fn http_status(&self) -> u16 {
         match self {
-            Self::InvalidName => 400,
+            Self::InvalidName | Self::InvalidLimits(_) => 400,
             Self::NotFound => 404,
             Self::Overloaded => 503,
             Self::TenantBusy => 429,
@@ -130,6 +134,10 @@ mod tests {
         let cases: Vec<(InvokeError, u16)> = vec![
             (InvokeError::InvalidName, 400),
             (InvokeError::NotFound, 404),
+            (
+                InvokeError::InvalidLimits(crate::ConfigError::CpuBudgetRange),
+                400,
+            ),
             (InvokeError::Overloaded, 503),
             (InvokeError::TenantBusy, 429),
             (

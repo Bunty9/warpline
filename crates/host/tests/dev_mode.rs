@@ -252,3 +252,30 @@ async fn overload_and_tenant_busy_map_to_503_and_429() {
     let (status, _) = invoke(&busy, "acme", "echo", b"x").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// An unreachable auth database is a 503 (retryable), not a 500.
+#[tokio::test]
+async fn auth_database_outage_is_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy("postgres://x:x@127.0.0.1:1/x")
+        .unwrap();
+    let runtime = Runtime::new(RuntimeConfig::new(dir.path())).expect("build runtime");
+    let router = warpline_host::router(warpline_host::AppState {
+        runtime,
+        auth: Some(warpline_core::pg::Authenticator::new(
+            pool,
+            std::time::Duration::from_secs(5),
+        )),
+        metrics_handle: warpline_host::metrics_handle(),
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/tenants/acme/functions/f/invoke")
+        .header("authorization", "Bearer wl_whatever")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

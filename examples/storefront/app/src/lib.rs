@@ -279,14 +279,12 @@ async fn checkout(
     };
     // The route is public, so there is no key to take limits from: read the
     // merchant's stored limits. (A busy app would cache this.) An unknown
-    // merchant is a 404 before any hook runs.
+    // merchant is a 404 before any hook runs; a failed read is treated like
+    // a failed hook (fail open, below) rather than a 500.
     let limits = match pg::tenant_limits(&state.pool, &merchant).await {
-        Ok(Some(l)) => l,
+        Ok(Some(l)) => Ok(l),
         Ok(None) => return error(StatusCode::NOT_FOUND, "unknown merchant"),
-        Err(e) => {
-            tracing::error!(error = %e, "tenant_limits failed");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "merchant lookup failed");
-        }
+        Err(e) => Err(format!("merchant limits unavailable: {e}")),
     };
     let input = match serde_json::to_vec(&HookInput {
         customer: &order.customer,
@@ -301,14 +299,19 @@ async fn checkout(
     // [warpline 6] Invoke with the merchant's own limits: CPU budget, memory
     // cap and the http-out allowlist all come from `limits`. `invoke` never
     // queues; it fails fast with Overloaded / TenantBusy.
-    let result = state
-        .runtime
-        .invoke(&merchant, HOOK_FN, input, &limits)
-        .await
-        .map(|inv| inv.output);
-
-    // [warpline 7] Turn whatever happened into a shopper-facing outcome.
-    let (approved, discount, message, hook) = match checkout::resolve(result, subtotal) {
+    let verdict = match limits {
+        Ok(limits) => {
+            let result = state
+                .runtime
+                .invoke(&merchant, HOOK_FN, input, &limits)
+                .await
+                .map(|inv| inv.output);
+            // [warpline 7] Turn whatever happened into a shopper-facing outcome.
+            checkout::resolve(result, subtotal)
+        }
+        Err(why) => Verdict::FailOpen(why),
+    };
+    let (approved, discount, message, hook) = match verdict {
         Verdict::Hook(d) => (d.approved, d.discount_cents, d.message, "ok"),
         Verdict::NoHook => (true, 0, "approved".into(), "none"),
         Verdict::FailOpen(why) => {

@@ -6,6 +6,15 @@
 //! can't become a query storm. **Consequence: a limits change or key
 //! revocation can take up to the TTL to be seen by this instance.** A TTL
 //! of zero disables the cache.
+//!
+//! **Database outage.** The lookup is bounded by a 2 s timeout. If it fails
+//! (error or timeout) and the cache holds an entry past its TTL, that stale
+//! entry is served instead, so keys that were already in use keep working
+//! while Postgres is down. Staleness is capped at `max(10 x TTL, 5 minutes)`:
+//! long enough to ride out a failover, short enough that a revoked key does
+//! not live on for long. Unknown-key (negative) entries get the same
+//! treatment, for consistency. A key never seen (or cached longer ago than
+//! the cap) gets [`AuthError`], which callers should map to 503.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -16,6 +25,11 @@ use sqlx::PgPool;
 
 use crate::cache::digest;
 use crate::Limits;
+
+/// Upper bound on one auth lookup; a timeout is treated like a DB error.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Floor of the stale-serving window (see the module docs).
+const MIN_STALE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Bounds worst-case memory from a flood of distinct bogus tokens.
 const CACHE_CAP: usize = 10_000;
@@ -40,6 +54,9 @@ pub enum AuthError {
     Db(#[from] sqlx::Error),
 }
 
+/// `(tenant name, allowed_hosts, cpu_budget_ms, mem_cap_bytes)`.
+type AuthRow = (String, Vec<String>, i32, i64);
+
 /// What is cached per key hash. Also what the DB row decodes to.
 #[derive(Clone)]
 enum Cached {
@@ -54,6 +71,11 @@ struct Inner {
 }
 
 /// Cheap to clone; clones share the pool and the cache.
+///
+/// Lookups are cached per instance for the TTL (limits changes and key
+/// revocations take up to that long to be seen). When the database is
+/// unreachable, entries past their TTL are still served for up to
+/// `max(10 x TTL, 5 min)`; see the module docs.
 #[derive(Clone)]
 pub struct Authenticator(Arc<Inner>);
 
@@ -93,23 +115,46 @@ impl Authenticator {
         let inner = &*self.0;
         let key_hash = digest(token.as_bytes());
 
+        let mut stale = None;
         if !inner.ttl.is_zero() {
             let hit = inner.cache.lock().unwrap().get(&key_hash).cloned();
             if let Some((at, cached)) = hit {
                 if at.elapsed() < inner.ttl {
                     return Ok(outcome(cached, tenant));
                 }
+                if at.elapsed() < (inner.ttl * 10).max(MIN_STALE_WINDOW) {
+                    stale = Some(cached);
+                }
             }
         }
 
-        let row: Option<(String, Vec<String>, i32, i64)> = sqlx::query_as(
-            "SELECT t.name, t.allowed_hosts, t.cpu_budget_ms, t.mem_cap_bytes \
-             FROM warpline.api_keys k JOIN warpline.tenants t ON t.id = k.tenant_id \
-             WHERE k.key_hash = $1",
+        let row: Result<Option<AuthRow>, sqlx::Error> = match tokio::time::timeout(
+            LOOKUP_TIMEOUT,
+            sqlx::query_as(
+                "SELECT t.name, t.allowed_hosts, t.cpu_budget_ms, t.mem_cap_bytes \
+                     FROM warpline.api_keys k JOIN warpline.tenants t ON t.id = k.tenant_id \
+                     WHERE k.key_hash = $1",
+            )
+            .bind(&key_hash)
+            .fetch_optional(&inner.pool),
         )
-        .bind(&key_hash)
-        .fetch_optional(&inner.pool)
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(sqlx::Error::PoolTimedOut),
+        };
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => {
+                return match stale {
+                    Some(cached) => {
+                        tracing::warn!(error = %e, "auth lookup failed; serving stale cache entry");
+                        Ok(outcome(cached, tenant))
+                    }
+                    None => Err(e.into()),
+                };
+            }
+        };
         let cached = match row {
             None => Cached::Unknown,
             Some((tenant, allowed_hosts, cpu, mem)) => {

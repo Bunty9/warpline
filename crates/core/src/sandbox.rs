@@ -246,7 +246,7 @@ pub(crate) struct EpochTicker {
 
 impl EpochTicker {
     /// Spawn the ticker thread for `engine`.
-    pub fn spawn(engine: Engine) -> Self {
+    pub fn spawn(engine: Engine) -> Result<Self, crate::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
@@ -271,11 +271,11 @@ impl EpochTicker {
                     engine.increment_epoch();
                 }
             })
-            .expect("spawn epoch ticker thread");
-        Self {
+            .map_err(|e| crate::Error::Internal(format!("spawn epoch ticker thread: {e}")))?;
+        Ok(Self {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -521,7 +521,9 @@ const INSTANTIATE_GRACE_TICKS: u64 = 2;
 /// forgives at most the grace that instantiation used, so the whole
 /// invocation is cut off within `budget + grace + 1` ticks.
 fn call_limit(ticks_used_by_instantiation: u64, budget_ticks: u64) -> u64 {
-    ticks_used_by_instantiation.min(INSTANTIATE_GRACE_TICKS) + budget_ticks
+    ticks_used_by_instantiation
+        .min(INSTANTIATE_GRACE_TICKS)
+        .saturating_add(budget_ticks)
 }
 
 /// Marker error returned by the epoch deadline callback once a store's tick
@@ -604,7 +606,9 @@ pub(crate) async fn run(
         // yield to the tokio executor and extend the deadline by one tick.
         // The deadline is re-based after each yield, so time spent waiting to
         // be re-polled is not counted. Limits: see `call_limit`.
-        let limit = Arc::new(AtomicU64::new(budget_ticks + INSTANTIATE_GRACE_TICKS));
+        let limit = Arc::new(AtomicU64::new(
+            budget_ticks.saturating_add(INSTANTIATE_GRACE_TICKS),
+        ));
         let (ticks_cb, limit_cb) = (ticks.clone(), limit.clone());
         store.epoch_deadline_callback(move |_store| {
             let n = ticks_cb.fetch_add(1, Ordering::Relaxed) + 1;
