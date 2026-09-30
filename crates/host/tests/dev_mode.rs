@@ -44,7 +44,13 @@ fn control_router(modules_dir: &Path) -> axum::Router {
 }
 
 fn host_router(modules_dir: &Path) -> axum::Router {
-    let runtime = Runtime::builder(RuntimeConfig::new(modules_dir))
+    host_router_with(modules_dir, |_| {})
+}
+
+fn host_router_with(modules_dir: &Path, tweak: impl FnOnce(&mut RuntimeConfig)) -> axum::Router {
+    let mut cfg = RuntimeConfig::new(modules_dir);
+    tweak(&mut cfg);
+    let runtime = Runtime::builder(cfg)
         .meter(Arc::new(warpline_host::LogMeter))
         .build()
         .expect("build runtime");
@@ -195,4 +201,34 @@ async fn invoke_recovers_after_cwasm_is_deleted() {
         before,
         "expected the cwasm to be re-published"
     );
+}
+
+/// Admission control surfaces as 503 (memory budget) and 429 (per-tenant
+/// in-flight cap) over HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_and_tenant_busy_map_to_503_and_429() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let control = control_router(dir.path());
+    let (status, _) = upload(&control, "acme", "echo", TEST_GUEST_WASM).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Default limits reserve 64 MiB; a 32 MiB budget can never admit that.
+    let small = host_router_with(dir.path(), |c| c.memory_budget_bytes = 32 * 1024 * 1024);
+    let (status, _) = invoke(&small, "acme", "echo", b"x").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // One slot per tenant: a spinning invoke holds it, so the next is 429.
+    let busy = host_router_with(dir.path(), |c| c.max_in_flight_per_tenant = 1);
+    let spinner = {
+        let busy = busy.clone();
+        tokio::spawn(async move { invoke(&busy, "acme", "echo", b"loop").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, _) = invoke(&busy, "acme", "echo", b"x").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let (status, _) = spinner.await.unwrap();
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    // Slot released.
+    let (status, _) = invoke(&busy, "acme", "echo", b"x").await;
+    assert_eq!(status, StatusCode::OK);
 }

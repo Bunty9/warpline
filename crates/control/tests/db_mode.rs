@@ -365,3 +365,42 @@ async fn upload_for_deleted_tenant_with_cached_key_is_unauthorized() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+/// PATCH semantics: a body naming one field leaves the others as they were.
+#[tokio::test]
+async fn admin_body_patches_only_the_named_fields() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let tenant = unique_tenant("patch");
+    let (state, _dir) = state(db, Some("tok")).await;
+    let app = router(state);
+    let uri = format!("/admin/tenants/{tenant}");
+
+    let (status, _) = post(
+        &app,
+        &uri,
+        Some("tok"),
+        Some(serde_json::json!({ "cpu_budget_ms": 250, "allowed_hosts": ["api.example.com"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = post(
+        &app,
+        &uri,
+        Some("tok"),
+        Some(serde_json::json!({ "mem_cap_bytes": 8 * 1024 * 1024 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let l = pg::tenant_limits(&pool, &tenant).await.unwrap().unwrap();
+    assert_eq!(l.cpu_budget_ms, 250);
+    assert_eq!(l.mem_cap_bytes, 8 * 1024 * 1024);
+    assert_eq!(l.allowed_hosts, ["api.example.com"]);
+
+    // No body at all changes nothing either.
+    let (status, _) = post(&app, &uri, Some("tok"), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(pg::tenant_limits(&pool, &tenant).await.unwrap().unwrap(), l);
+}

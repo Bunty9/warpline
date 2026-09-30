@@ -16,6 +16,54 @@
 | [`warpline-host`](https://crates.io/crates/warpline-host) | Binary: invoke server (`cargo install warpline-host`) |
 | [`warpline-control`](https://crates.io/crates/warpline-control) | Binary: upload + admin API (`cargo install warpline-control`) |
 
+## Embedding warpline in your app
+
+`warpline-core` is a library: hold a `Runtime`, publish components under
+`(tenant, function)` names and invoke them. The same example runs as a
+doctest in [`crates/core/src/runtime.rs`](crates/core/src/runtime.rs). Its
+`# ` scaffolding lines (a `main` and a tempdir) are shown here as real code:
+
+```rust
+use std::sync::Arc;
+use warpline_core::{Bytes, Limits, MemKv, Runtime, RuntimeConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let runtime = Runtime::builder(RuntimeConfig::new(dir.path()))
+        .kv(Arc::new(MemKv::new()))
+        .build()?;
+
+    // A component implementing the `handler` world (see `wit/warpline.wit`);
+    // this one, from the test suite, echoes its input.
+    let wasm = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_guest.wasm"));
+    runtime.publish("acme", "hello", Bytes::from_static(wasm)).await?;
+
+    let limits = Limits::new(50, 32 << 20)?;
+    let out = runtime.invoke("acme", "hello", b"hi".to_vec(), &limits).await?;
+    assert_eq!(out.output, b"hi");
+    println!("{} bytes back, {} us cpu", out.output.len(), out.usage.cpu_us);
+    Ok(())
+}
+```
+
+`invoke` never queues: a tenant over its in-flight cap gets `TenantBusy`
+(429) and an invocation the memory budget cannot admit gets `Overloaded`
+(503); `InvokeError::http_status` gives the mapping. Plug in your own
+`KvStore` and `MeterSink` through the builder. With the default `postgres`
+feature, `warpline_core::pg` adds schema-isolated migrations
+(`pg::migrate`, everything in a `warpline` schema), API-key auth
+(`Authenticator`), tenant admin (`create_tenant`, `patch_tenant`,
+`set_limits`, `usage_summary`) and a batching `PgMeter`. The library never
+reads environment variables or migrates implicitly.
+
+| You want | Use |
+| --- | --- |
+| A ready-made HTTP invoke and upload server, configured by environment variables | The binaries: `warpline-host` (+ `warpline-control`, or `WARPLINE_EMBED_CONTROL=1` for one process) |
+| Your own routes, auth, storage or metering around the runtime | Embed `warpline-core` |
+| Untrusted customer hooks called from inside your own app's request path | Embed `warpline-core` |
+| One box, customers upload and call functions directly | The binaries |
+
 ## The problem
 
 Customer-customization is a recurring need in any SaaS or agency product —
@@ -37,6 +85,7 @@ process via `WARPLINE_EMBED_CONTROL=1`.
 ```
                          +----------------------+
                          |       Postgres        |
+                         | schema `warpline`:     |
                          | tenants, api_keys,     |
                          | functions, meter       |
                          +----^--------------^----+
@@ -66,13 +115,19 @@ process via `WARPLINE_EMBED_CONTROL=1`.
                               one epoch-ticker thread per engine
 ```
 
-`warpline-control` compiles an uploaded `.wasm` to a `Component`,
-type-checks its imports/exports against the `warpline:host/handler` world,
-and only then persists the source bytes + compiled `.cwasm` and publishes a
-`(tenant, func) -> digest` pointer file. `warpline-host` reads the pointer,
-resolves the digest through an in-memory LRU backed by the shared `cwasm/`
-directory, and calls the component's `handle` export inside a fresh
-`wasmtime::Store` with per-tenant caps installed. There is no S3/MinIO in
+Both binaries are thin HTTP layers over `warpline_core::Runtime` and
+`warpline_core::pg`. `warpline-control` calls `Runtime::stage`, which
+compiles an uploaded `.wasm` to a `Component`, type-checks its
+imports/exports against the `warpline:host/handler` world, and only then
+persists the source bytes + compiled `.cwasm`. It then takes a per-tenant
+advisory lock in a Postgres transaction, checks the function quota, upserts
+the `functions` row, and calls `Runtime::activate` to write the
+`(tenant, func) -> digest` pointer file *before* committing (restoring the
+previous pointer if the commit fails). `warpline-host` calls
+`Runtime::invoke`, which reads the pointer, resolves the digest through an
+in-memory LRU backed by the shared `cwasm/` directory, and calls the
+component's `handle` export inside a fresh `wasmtime::Store` with per-tenant
+caps installed. There is no S3/MinIO in
 this deployment shape — the module registry is a single shared volume,
 which is enough for a one-box deploy (see "Roadmap / deferred").
 
@@ -81,25 +136,28 @@ which is enough for a one-box deploy (see "Roadmap / deferred").
 | Layer              | Crate(s)                                                            |
 | ------------------ | -------------------------------------------------------------------- |
 | Runtime            | `wasmtime` 49 + `wasmtime-wasi` 49 p2 (async, cranelift, parallel-compilation, component-model) |
-| HTTP server        | `axum` 0.8 + `tokio` 1.47 + `tower-http`                              |
-| Database           | `sqlx` 0.8 + Postgres 16                                              |
+| HTTP server        | `axum` 0.8 + `tokio` 1.47                                             |
+| Database           | `sqlx` 0.8 + Postgres 16 (`warpline_core::pg`, feature `postgres`)    |
 | KV trait + in-mem  | `async-trait` + `tokio::sync::RwLock` (`MemKv`)                       |
 | Module cache       | `sha2` + `hex` (content-hash → `.cwasm`) + `lru` (in-memory `Component` cache) |
 | Outbound HTTP      | `reqwest` (rustls-tls), allowlist + no redirects + no proxy + private-address blocking |
 | Observability      | `tracing` (+ `tracing-subscriber` json) + `metrics` + `metrics-exporter-prometheus` |
-| Errors             | `anyhow` + `thiserror` 2                                              |
+| Errors             | `thiserror` 2 in the libraries, `anyhow` in the binaries              |
 
 ## Security model / isolation
 
 Every cap below is enforced per invocation or per tenant. Values marked
-"configurable" come from the `tenants` table (`admin_create_tenant`,
-validated against the ranges in `warpline_core::types`) and default to
+"configurable" come from the `tenants` table (set through
+`POST /admin/tenants/{tenant}` or `pg::create_tenant`/`pg::patch_tenant`,
+validated against the ranges in `warpline_core::types`) and are
 [`Limits::default`](crates/core/src/types.rs) under
-`WARPLINE_INSECURE_DEV=1`.
+`WARPLINE_INSECURE_DEV=1`. Process-wide values that name a `RuntimeConfig`
+field are set by whoever builds the `Runtime`; the binaries use the
+defaults shown.
 
 | Cap                                             | Value                                          | Enforced by |
 | ------------------------------------------------ | ----------------------------------------------- | ----------- |
-| CPU budget (configurable)                       | 1 – 10,000 ms, default 100 ms                   | epoch-deadline callback, `runtime::invoke` |
+| CPU budget (configurable)                       | 1 – 10,000 ms, default 100 ms                   | epoch-deadline callback, `sandbox::run` |
 | Memory cap — linear memory (configurable)       | 1 MiB – 512 MiB, default 64 MiB                 | `TenantLimiter::memory_growing` |
 | Core instances per `Store`                      | 32                                               | `TenantLimiter::instances` |
 | Core tables per `Store`                         | 8                                                 | `TenantLimiter::tables` |
@@ -109,11 +167,11 @@ validated against the ranges in `warpline_core::types`) and default to
 | KV value size (per `put`)                       | 1 MiB                                             | `kv::Host::put` |
 | KV `put` calls per invocation                   | 1,000                                             | `HostCtx::kv_put_count` |
 | KV `put` bytes per invocation                   | 8 MiB                                             | `HostCtx::kv_put_bytes` |
-| KV storage per tenant (`MemKv`)                 | 16 MiB                                            | `kv::MemKv::DEFAULT_TENANT_CAP_BYTES` |
+| KV storage per tenant (`MemKv`)                 | 16 MiB                                            | `kv::DEFAULT_TENANT_CAP_BYTES` |
 | Log line length                                 | 4 KiB (truncated, not trapped)                    | `log::Host::emit` |
 | Log lines per invocation                        | 100 (dropped after, one "suppressed" notice)      | `log::Host::emit` |
 | Log bytes per invocation                        | 64 KiB                                            | `log::Host::emit` |
-| `http-out` response body                        | 1 MiB (fetch errs past this)                      | `runtime::http_fetch` |
+| `http-out` response body                        | 1 MiB (fetch errs past this)                      | `sandbox::http_fetch` |
 | `http-out` request timeout                      | 5 s                                               | shared `reqwest::Client` |
 | `http-out` allowed hosts per tenant             | 64                                                | `validate_allowed_hosts` |
 | `http-out` redirects                            | none followed                                     | `reqwest::redirect::Policy::none()` |
@@ -121,11 +179,14 @@ validated against the ranges in `warpline_core::types`) and default to
 | `http-out` private/loopback/link-local targets  | blocked unless `WARPLINE_ALLOW_PRIVATE_EGRESS=1`  | `is_blocked_ip`, `GuardedResolver` |
 | Upload body (`.wasm`)                           | 16 MiB                                            | `UPLOAD_BODY_LIMIT_BYTES` |
 | Invoke request body                             | 1 MiB                                             | `INVOKE_BODY_LIMIT_BYTES` |
-| Functions per tenant                            | 100                                               | `MAX_FUNCTIONS_PER_TENANT`, enforced in the publish transaction |
-| Compile concurrency (process-wide)              | `max(available_parallelism / 2, 1)` permits       | `AppState::new`'s `compile_semaphore` |
-| In-memory component cache                       | 256 entries, 512 MiB total serialized bytes       | `COMPONENT_CACHE_CAP`, `COMPONENT_CACHE_BYTE_BUDGET` |
-| Epoch tick                                      | 1 ms                                              | `EpochTicker`, `EPOCH_TICK_MS` |
+| Functions per tenant                            | 100                                               | `DEFAULT_MAX_FUNCTIONS_PER_TENANT` (`warpline-control`), enforced in the publish transaction |
+| Compile concurrency (process-wide)              | `max(available_parallelism / 2, 1)` permits       | `RuntimeConfig::compile_concurrency` |
+| In-memory component cache                       | 256 entries, 512 MiB total serialized bytes       | `RuntimeConfig::component_cache_entries` / `component_cache_bytes` |
+| Epoch tick                                      | 1 ms                                              | `sandbox::EpochTicker`, `EPOCH_TICK_MS` |
 | Wall-clock backstop per invoke                  | `cpu_budget_ms` + http timeout (5 s) + 1 s slack  | `tokio::time::timeout` around the whole call |
+| Admission budget (process-wide guest memory)    | 1 GiB (each invoke weighs its memory cap, whole MiB); over budget: fail fast, `503` | `RuntimeConfig::memory_budget_bytes` |
+| In-flight invocations per tenant                | 32; over the cap: fail fast, `429`                 | `RuntimeConfig::max_in_flight_per_tenant` |
+| Output size per invocation                      | 8 MiB; over the cap: `502`                         | `RuntimeConfig::max_output_bytes` |
 
 Guests get a deny-by-default WASI p2 context: no preopens, no env, no args,
 no sockets — only what a `wasm32-wasip2` Rust std needs to link (clocks,
@@ -135,7 +196,7 @@ random, a stdio sink). Outbound network access exists only through the
 ### CPU budget: one epoch ticker, cooperative yield
 
 CPU budget is enforced by wasmtime's epoch interruption, driven by a single
-background thread per `Engine` ([`EpochTicker`](crates/core/src/runtime.rs))
+background thread per `Engine` ([`EpochTicker`](crates/core/src/sandbox.rs))
 that increments the engine-wide epoch counter every `EPOCH_TICK_MS` (1 ms),
 sleeping to an **absolute** schedule rather than a relative `sleep(tick)` in
 a loop — a relative sleep overshoots a little every iteration, and since
@@ -218,7 +279,7 @@ docker compose up -d
 
 This starts Postgres, `warpline-host` (`:8080`, invoke) and
 `warpline-control` (`:8081`, upload + admin), migrations included (both
-binaries run `sqlx::migrate!` on boot against `DATABASE_URL`).
+binaries call `pg::migrate` on boot against `DATABASE_URL`).
 `WARPLINE_ADMIN_TOKEN` is set to the placeholder `change-me` in
 `docker-compose.yml` — replace it before any non-local deployment.
 
@@ -232,7 +293,10 @@ curl -X POST -H "Authorization: Bearer change-me" \
 
 Every call to `POST /admin/tenants/{tenant}` is idempotent on the tenant
 row but issues a **fresh** API key each time; older keys for the same
-tenant keep working (each key hash is its own row in `api_keys`).
+tenant keep working (each key hash is its own row in `api_keys`). A body
+with limits has PATCH semantics: fields you leave out keep the tenant's
+current values (the defaults, for a new tenant), so
+`{"cpu_budget_ms": 250}` does not reset the allowlist.
 
 Build the demo guest (installs `wasm32-wasip2` if missing, builds
 `examples/hello-wasm` and `examples/test-guest`, refreshes the committed
@@ -268,11 +332,12 @@ The request body becomes `handle`'s `input: list<u8>` argument verbatim;
 
 ## Configuration
 
-Every environment variable either binary reads, with its default:
+Every environment variable either binary reads, with its default (the
+embedding library reads none):
 
 | Variable                        | Read by         | Default                                                | Purpose |
 | -------------------------------- | ---------------- | ------------------------------------------------------- | ------- |
-| `DATABASE_URL`                  | host, control    | unset (refuses to start unless `WARPLINE_INSECURE_DEV=1`) | Postgres connection string. Enables auth, tenant limits, and metering; the binaries run `pg::migrate` on boot (everything lives in the `warpline` schema). |
+| `DATABASE_URL`                  | host, control    | unset (refuses to start unless `WARPLINE_INSECURE_DEV=1`) | Postgres connection string. Enables auth, tenant limits, and metering; the binaries run `pg::migrate` on boot (everything lives in the `warpline` schema). Pool: 10 connections, 2 s acquire timeout. |
 | `WARPLINE_INSECURE_DEV`         | host, control    | unset                                                    | Set to `1` to run without Postgres: no auth enforced, every tenant gets `Limits::default` (empty allowlist, 100 ms CPU, 64 MiB memory), invocations are logged at debug level instead of metered. Not for production. |
 | `WARPLINE_ADMIN_TOKEN`          | control (host if embedded) | unset (`/admin/tenants/{tenant}` 404s)                   | Bearer token guarding the admin route. |
 | `WARPLINE_MODULES_DIR`          | host, control    | `./modules`                                              | Root of the shared module registry (`wasm/`, `cwasm/`, `tenants/`). |
@@ -280,9 +345,13 @@ Every environment variable either binary reads, with its default:
 | `WARPLINE_CONTROL_BIND`         | control (host if embedded) | `127.0.0.1:8081` under `WARPLINE_INSECURE_DEV`, else `0.0.0.0:8081` | `warpline-control`'s listen address. |
 | `WARPLINE_METRICS_BIND`         | host             | `127.0.0.1:9090`                                         | Separate `/metrics` listener — never on the main router (would leak per-tenant series to whatever's publicly reachable). |
 | `WARPLINE_AUTH_CACHE_TTL_SECS`  | host, control    | `30` (`0` disables)                                      | TTL of the in-process API-key lookup cache (positive and negative results). Key revocation and tenant config changes take up to this long to apply. |
-| `WARPLINE_EMBED_CONTROL`        | host             | unset                                                    | Set to `1` to also serve the control-plane API from the host process (same engine, same volume), and run the startup blob GC there. Used by `fly.toml`, since a Fly volume attaches to one machine. |
+| `WARPLINE_EMBED_CONTROL`        | host             | unset                                                    | Set to `1` to also serve the control-plane API from the host process (same engine, same volume), and run the startup blob GC there. Needs the `embed-control` cargo feature (on by default; ignored with a warning without it). Used by `fly.toml`, since a Fly volume attaches to one machine. |
+| `RUST_LOG`                      | host, control    | `info`                                                   | `tracing` filter directive; logs are JSON. |
 | `WARPLINE_ALLOW_PRIVATE_EGRESS` | host             | unset (`false`)                                          | Set to `1` to let `http-out` reach loopback/private/link-local addresses (local dev only). |
-| `WARPLINE_TEST_DATABASE_URL`    | tests only       | unset (DB-backed tests skip themselves)                  | Postgres URL for `crates/{host,control}/tests/db_mode.rs`. |
+| `WARPLINE_TEST_DATABASE_URL`    | tests only       | unset (DB-backed tests skip themselves)                  | Postgres URL for `crates/core/tests/pg.rs` and `crates/{host,control}/tests/db_mode.rs`. |
+
+An environment variable that is set but empty counts as unset. The binaries
+are the only place that reads the environment; `warpline-core` never does.
 
 ## HTTP API reference
 
@@ -307,8 +376,9 @@ Every environment variable either binary reads, with its default:
   <WARPLINE_ADMIN_TOKEN>`. JSON body, every field optional:
   `{"allowed_hosts": [string], "cpu_budget_ms": int, "mem_cap_bytes": int}`.
   - `201` `{"tenant","api_key"}` — creates the tenant if new (idempotent),
-    applies any config fields given, always issues a fresh `wl_`-prefixed
-    key.
+    applies the config fields given (PATCH semantics: omitted fields keep
+    their current values, or the defaults for a new tenant), always issues
+    a fresh `wl_`-prefixed key.
   - `400` invalid tenant name, invalid JSON, or a config value outside its
     range (`cpu_budget_ms` 1–10,000; `mem_cap_bytes` 1 MiB–512 MiB;
     `allowed_hosts` ≤ 64 entries).
@@ -326,7 +396,10 @@ Every environment variable either binary reads, with its default:
   - `400` invalid tenant/func name. `401`/`403` as above.
   - `404` no module published for `(tenant, func)`.
   - `408` CPU budget exceeded, or the wall-clock backstop fired.
+  - `429` the tenant already has its maximum invocations in flight.
   - `500` guest trap, failed to instantiate, or an internal error.
+  - `502` the guest returned more than the output cap (8 MiB).
+  - `503` the host's memory admission budget is full; retry shortly.
   - `507` memory cap exceeded.
 - **`GET /healthz`** — `200 ok`.
 - **`GET /metrics`** — on `WARPLINE_METRICS_BIND` (default
@@ -396,11 +469,13 @@ cargo clippy --workspace --all-targets
 cargo nextest run --workspace     # or `cargo test --workspace`
 ```
 
-Most of the test suite runs with no external dependencies (`InsecureDev`
-mode, in-memory `MemKv`, tempdir module registries). A second tier of
-DB-backed tests (`crates/{host,control}/tests/db_mode.rs`) only runs when
+Most of the test suite runs with no external dependencies (dev mode without
+a database, in-memory `MemKv`, tempdir module registries). A second tier of
+DB-backed tests (`crates/core/tests/pg.rs`,
+`crates/{host,control}/tests/db_mode.rs`) only runs when
 `WARPLINE_TEST_DATABASE_URL` is set — they cover the admin route, API-key
-auth, and the per-tenant function quota against a real Postgres:
+auth, tenant limits, metering, and the per-tenant function quota against
+a real Postgres:
 
 ```bash
 docker compose up -d postgres
@@ -420,11 +495,11 @@ when `examples/test-guest` changes; commit the result.
 warpline/
   Cargo.toml                          # workspace root (excludes examples/*)
   crates/
-    core/                             # Engine + host imports + cache + registry + meter + auth
-      src/{lib,runtime,types,kv,cache,registry,meter,auth}.rs
+    core/                             # Runtime facade + sandbox + cache + registry (+ pg)
+      src/{lib,runtime,sandbox,types,kv,cache,registry,meter,error}.rs
+      src/pg/{mod,auth,admin,meter}.rs  # feature `postgres`: migrate, auth, admin, PgMeter
       wit/warpline.wit                # capability surface (Component Model)
-      migrations/0001_init.sql        # tenants, functions, meter tables
-      migrations/0002_auth_config.sql # api_keys, tenant resource caps, meter.ok
+      migrations/0001_warpline.sql    # `warpline` schema: tenants, api_keys, functions, meter
     host/                             # axum invoke API, :8080 (+ /metrics on :9090)
     control/                          # axum upload + admin API, :8081
   examples/
@@ -440,7 +515,9 @@ warpline/
     specs/2026-05-28-warpline-design.md
     plans/2026-05-28-warpline-phase-1-scaffold.md
     plans/2026-09-26-warpline-phase-2-runtime.md
-  PROGRESS.md                         # per-sprint tracker, bench numbers
+    plans/2026-09-28-publishing.md
+    plans/2026-09-30-warpline-0.2-embedding.md
+  PROGRESS.md                         # per-sprint tracker (Phase 1 is historical), 0.2 status, bench numbers
 ```
 
 ## Roadmap / deferred

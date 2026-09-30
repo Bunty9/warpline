@@ -10,7 +10,10 @@ mod admin;
 mod auth;
 mod meter;
 
-pub use admin::{create_tenant, set_limits, usage_summary, AdminError, IssuedKey, UsageSummary};
+pub use admin::{
+    create_tenant, patch_tenant, set_limits, tenant_limits, usage_summary, AdminError, IssuedKey,
+    LimitsPatch, UsageSummary,
+};
 pub use auth::{AuthError, AuthOutcome, Authenticator};
 pub use meter::{PgMeter, PgMeterHandle};
 pub use sqlx::PgPool;
@@ -22,6 +25,18 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// Arbitrary constant for the advisory lock that serialises concurrent
 /// `CREATE SCHEMA` calls (sqlx's own lock only covers the migrations).
 const SCHEMA_LOCK_KEY: i64 = 0x7761_7270_6c69_6e65; // "warpline"
+
+/// Open a pool with the settings the warpline binaries use: at most 10
+/// connections, and a 2 s acquire timeout so a saturated pool fails requests
+/// fast instead of queueing them. Embedders are free to build their own
+/// [`PgPool`] instead.
+pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(url)
+        .await
+}
 
 /// [`migrate`] failure.
 #[derive(Debug, thiserror::Error)]

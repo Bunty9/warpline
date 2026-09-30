@@ -773,3 +773,33 @@ async fn recompile_works_with_read_only_cwasm_dir() {
         b"still works"
     );
 }
+
+#[tokio::test]
+async fn active_and_deactivate_round_trip() {
+    let (rt, _dir) = setup_with(&[], |_| {}).await;
+    assert!(rt.active("tenant-a", FN).await.unwrap().is_none());
+
+    let staged = rt
+        .publish("tenant-a", FN, Bytes::from_static(TEST_GUEST_WASM))
+        .await
+        .unwrap();
+    let active = rt
+        .active("tenant-a", FN)
+        .await
+        .unwrap()
+        .expect("pointer set");
+    assert_eq!(active, staged);
+
+    // Deactivate removes the pointer (and is idempotent); re-activating the
+    // remembered value restores it.
+    rt.deactivate("tenant-a", FN).await.unwrap();
+    rt.deactivate("tenant-a", FN).await.unwrap();
+    assert!(rt.active("tenant-a", FN).await.unwrap().is_none());
+    let err = rt
+        .invoke("tenant-a", FN, b"{}".to_vec(), &limits(1000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, InvokeError::NotFound), "{err:?}");
+    rt.activate("tenant-a", FN, &active).await.unwrap();
+    assert_eq!(rt.active("tenant-a", FN).await.unwrap(), Some(active));
+}

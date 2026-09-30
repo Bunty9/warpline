@@ -52,6 +52,26 @@ fn cols(l: &Limits) -> (Vec<String>, i32, i64) {
     )
 }
 
+/// A partial change to a tenant's [`Limits`]: `None` fields keep the
+/// tenant's current value (or the default, for a tenant being created).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct LimitsPatch {
+    pub allowed_hosts: Option<Vec<String>>,
+    pub cpu_budget_ms: Option<u64>,
+    pub mem_cap_bytes: Option<usize>,
+}
+
+impl From<&Limits> for LimitsPatch {
+    fn from(l: &Limits) -> Self {
+        Self {
+            allowed_hosts: Some(l.allowed_hosts.clone()),
+            cpu_budget_ms: Some(l.cpu_budget_ms),
+            mem_cap_bytes: Some(l.mem_cap_bytes),
+        }
+    }
+}
+
 /// Create the tenant if missing and issue it a new API key (each call
 /// issues another; earlier keys keep working). With `Some(limits)` the
 /// tenant's limits are set to them; with `None` a new tenant gets the
@@ -65,48 +85,51 @@ pub async fn create_tenant(
     name: &str,
     limits: Option<&Limits>,
 ) -> Result<IssuedKey, AdminError> {
+    patch_tenant(
+        pool,
+        name,
+        &limits.map(LimitsPatch::from).unwrap_or_default(),
+    )
+    .await
+}
+
+/// Like [`create_tenant`], but only the fields set in `patch` change; the
+/// merge with the tenant's current values happens inside the upsert, so
+/// concurrent patches of different fields cannot overwrite each other.
+pub async fn patch_tenant(
+    pool: &PgPool,
+    name: &str,
+    patch: &LimitsPatch,
+) -> Result<IssuedKey, AdminError> {
     if !valid_name(name) {
         return Err(AdminError::InvalidName);
     }
-    let checked = limits
-        .map(|l| {
-            Limits::new(l.cpu_budget_ms, l.mem_cap_bytes)?.with_allowed_hosts(&l.allowed_hosts)
-        })
-        .transpose()?;
+    let defaults = Limits::default();
+    let cpu = patch.cpu_budget_ms.unwrap_or(defaults.cpu_budget_ms);
+    let mem = patch.mem_cap_bytes.unwrap_or(defaults.mem_cap_bytes);
+    let hosts = patch.allowed_hosts.as_deref().unwrap_or(&[]);
+    // Validates every field that is present (and the defaults, harmlessly).
+    let checked = Limits::new(cpu, mem)?.with_allowed_hosts(hosts)?;
 
     let mut key_bytes = [0u8; 32];
     getrandom::fill(&mut key_bytes).map_err(|e| AdminError::Rng(e.to_string()))?;
     let api_key = format!("wl_{}", hex::encode(key_bytes));
     let key_hash = digest(api_key.as_bytes());
 
+    let (hosts, cpu, mem) = cols(&checked);
     let mut tx = pool.begin().await?;
-    let tenant_id: sqlx::types::Uuid = match &checked {
-        None => {
-            sqlx::query_scalar(
-                "INSERT INTO warpline.tenants (name) VALUES ($1) \
-                 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
-            )
-            .bind(name)
-            .fetch_one(&mut *tx)
-            .await?
-        }
-        Some(l) => {
-            let (hosts, cpu, mem) = cols(l);
-            sqlx::query_scalar(
-                "INSERT INTO warpline.tenants (name, allowed_hosts, cpu_budget_ms, mem_cap_bytes) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (name) DO UPDATE SET allowed_hosts = EXCLUDED.allowed_hosts, \
-                    cpu_budget_ms = EXCLUDED.cpu_budget_ms, mem_cap_bytes = EXCLUDED.mem_cap_bytes \
-                 RETURNING id",
-            )
-            .bind(name)
-            .bind(hosts)
-            .bind(cpu)
-            .bind(mem)
-            .fetch_one(&mut *tx)
-            .await?
-        }
-    };
+    let tenant_id: sqlx::types::Uuid = sqlx::query_scalar(
+        "INSERT INTO warpline.tenants (name, allowed_hosts, cpu_budget_ms, mem_cap_bytes)          VALUES ($1, $2, $3, $4)          ON CONFLICT (name) DO UPDATE SET             allowed_hosts = CASE WHEN $5 THEN EXCLUDED.allowed_hosts ELSE tenants.allowed_hosts END,             cpu_budget_ms = CASE WHEN $6 THEN EXCLUDED.cpu_budget_ms ELSE tenants.cpu_budget_ms END,             mem_cap_bytes = CASE WHEN $7 THEN EXCLUDED.mem_cap_bytes ELSE tenants.mem_cap_bytes END          RETURNING id",
+    )
+    .bind(name)
+    .bind(hosts)
+    .bind(cpu)
+    .bind(mem)
+    .bind(patch.allowed_hosts.is_some())
+    .bind(patch.cpu_budget_ms.is_some())
+    .bind(patch.mem_cap_bytes.is_some())
+    .fetch_one(&mut *tx)
+    .await?;
     sqlx::query("INSERT INTO warpline.api_keys (key_hash, tenant_id) VALUES ($1, $2)")
         .bind(&key_hash)
         .bind(tenant_id)
@@ -117,6 +140,21 @@ pub async fn create_tenant(
         tenant: name.to_string(),
         api_key,
     })
+}
+
+/// A tenant's stored limits, or `None` if it does not exist.
+pub async fn tenant_limits(pool: &PgPool, name: &str) -> Result<Option<Limits>, AdminError> {
+    let row: Option<(Vec<String>, i32, i64)> = sqlx::query_as(
+        "SELECT allowed_hosts, cpu_budget_ms, mem_cap_bytes FROM warpline.tenants WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(allowed_hosts, cpu, mem)| Limits {
+        cpu_budget_ms: cpu as u64,
+        mem_cap_bytes: mem as usize,
+        allowed_hosts,
+    }))
 }
 
 /// Replace an existing tenant's limits. Authenticators with a cache see the

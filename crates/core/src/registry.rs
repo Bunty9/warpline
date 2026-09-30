@@ -84,6 +84,18 @@ pub(crate) fn write_pointer(
     cache::atomic_write(parent, &path, digest.as_bytes())
 }
 
+/// Remove the pointer file for `(tenant, func)`; a missing pointer (or an
+/// invalid name) is not an error.
+pub(crate) fn remove_pointer(modules_dir: &Path, tenant: &str, func: &str) -> Result<(), Error> {
+    let Some(path) = pointer_path(modules_dir, tenant, func) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Set `path`'s mtime to now. Errors (including `NotFound`) are returned.
 pub(crate) fn touch(path: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new()

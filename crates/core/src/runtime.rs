@@ -326,6 +326,34 @@ impl Runtime {
         .map_err(into_publish_err)
     }
 
+    /// The component `(tenant, func)` currently points at, if any. Lets a
+    /// caller that activates inside its own transaction remember what to
+    /// [`activate`](Self::activate) again (or [`deactivate`](Self::deactivate)
+    /// if `None`) when the transaction fails to commit.
+    pub async fn active(&self, tenant: &str, func: &str) -> Result<Option<Staged>, Error> {
+        let inner = self.0.clone();
+        let (tenant, func) = (tenant.to_owned(), func.to_owned());
+        let digest = tokio::task::spawn_blocking(move || {
+            registry::read_pointer(&inner.cfg.modules_dir, &tenant, &func)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("active task failed: {e}")))??;
+        Ok(digest.map(|digest| Staged { digest }))
+    }
+
+    /// Remove the `(tenant, func)` pointer, so invocations get
+    /// [`NotFound`](InvokeError::NotFound). Idempotent. The blobs stay until
+    /// [`gc`](Self::gc) collects them.
+    pub async fn deactivate(&self, tenant: &str, func: &str) -> Result<(), Error> {
+        let inner = self.0.clone();
+        let (tenant, func) = (tenant.to_owned(), func.to_owned());
+        tokio::task::spawn_blocking(move || {
+            registry::remove_pointer(&inner.cfg.modules_dir, &tenant, &func)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("deactivate task failed: {e}")))?
+    }
+
     /// [`stage`](Self::stage) then [`activate`](Self::activate).
     pub async fn publish(
         &self,

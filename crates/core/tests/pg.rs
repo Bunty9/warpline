@@ -206,6 +206,45 @@ async fn create_tenant_is_idempotent_and_issues_new_keys() {
 }
 
 #[tokio::test]
+async fn patch_tenant_changes_only_the_given_fields() {
+    let pool = pool_or_skip!();
+    let name = unique_tenant("patch");
+    assert_eq!(pg::tenant_limits(&pool, &name).await.unwrap(), None);
+
+    // A new tenant: unspecified fields take defaults.
+    let mut patch = pg::LimitsPatch::default();
+    patch.cpu_budget_ms = Some(7);
+    pg::patch_tenant(&pool, &name, &patch).await.unwrap();
+    let mut want = Limits::new(7, Limits::default().mem_cap_bytes).unwrap();
+    assert_eq!(
+        pg::tenant_limits(&pool, &name).await.unwrap(),
+        Some(want.clone())
+    );
+
+    // An existing tenant: only the given field moves.
+    let mut patch = pg::LimitsPatch::default();
+    patch.allowed_hosts = Some(vec!["Example.com".into()]);
+    pg::patch_tenant(&pool, &name, &patch).await.unwrap();
+    want.allowed_hosts = vec!["example.com".into()];
+    assert_eq!(
+        pg::tenant_limits(&pool, &name).await.unwrap(),
+        Some(want.clone())
+    );
+
+    // An empty patch changes nothing; an invalid value is rejected untouched.
+    pg::patch_tenant(&pool, &name, &pg::LimitsPatch::default())
+        .await
+        .unwrap();
+    let mut bad = pg::LimitsPatch::default();
+    bad.mem_cap_bytes = Some(1);
+    assert!(matches!(
+        pg::patch_tenant(&pool, &name, &bad).await,
+        Err(AdminError::Config(_))
+    ));
+    assert_eq!(pg::tenant_limits(&pool, &name).await.unwrap(), Some(want));
+}
+
+#[tokio::test]
 async fn meter_rows_land_and_summarise() {
     let pool = pool_or_skip!();
     let tenant = unique_tenant("meter");

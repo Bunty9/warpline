@@ -18,27 +18,29 @@ exclude = ["tests/"]
 name = "warpline-host"
 path = "src/main.rs"
 
-[dependencies]
-# Optional in-process control plane (`WARPLINE_EMBED_CONTROL=1`) for
+[features]
+default = ["embed-control"]
+# `WARPLINE_EMBED_CONTROL=1` runs the control plane inside this process, for
 # single-machine deploys where host and control must share one volume.
-warpline-control = { path = "../control", version = "0.1.0" }
+# Disable to drop the `warpline-control` dependency.
+embed-control = ["dep:warpline-control"]
+
+[dependencies]
+warpline-control = { path = "../control", version = "0.1.0", optional = true }
 warpline-core = { path = "../core", version = "0.1.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-sqlx = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
 # Dev-mode end-to-end tests upload through the real control-plane router
 # into a shared tempdir modules dir, then invoke through this crate's.
+warpline-control = { path = "../control", version = "0.1.0" }

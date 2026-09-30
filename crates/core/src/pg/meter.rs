@@ -83,10 +83,10 @@ impl MeterSink for PgMeter {
         };
         if self.tx.try_send(row).is_err() {
             // Warn on the 1st, 2nd, 4th, 8th... drop so a stall can't flood logs.
-            let before = self.dropped.fetch_add(1, Ordering::Relaxed);
-            if before == 0 || before.is_power_of_two() {
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if total.is_power_of_two() {
                 tracing::warn!(
-                    dropped_total = before + 1,
+                    dropped_total = total,
                     "meter queue full or closed; dropping rows"
                 );
             }

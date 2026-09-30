@@ -1,6 +1,8 @@
 //! `warpline-host` binary entry point. All routing and business logic
 //! lives in `warpline_host` (this crate's lib target) so it can be driven
 //! from tests via `tower::ServiceExt::oneshot` without a real socket.
+//!
+//! Environment handling lives only here; empty variables count as unset.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,12 +10,16 @@ use std::time::Duration;
 
 use warpline_core::{
     pg::{self, Authenticator, PgMeter},
-    MeterSink, Runtime, RuntimeConfig, GC_GRACE_PERIOD,
+    MeterSink, Runtime, RuntimeConfig,
 };
 use warpline_host::{metrics_handle, metrics_router, router, shutdown_signal, AppState, LogMeter};
 
 /// Rows the meter queue holds before it starts dropping (and counting).
 const METER_CHANNEL_CAPACITY: usize = 10_000;
+
+/// How long shutdown waits for the embedded control plane to finish.
+#[cfg(feature = "embed-control")]
+const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .json()
         .init();
+
+    // Before anything records a metric (including the meter export below).
+    let metrics_handle = metrics_handle();
 
     let auth = connect_auth().await?;
     let insecure_dev = auth.is_none();
@@ -56,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
         }
         None => (Arc::new(LogMeter), None),
     };
-    let metrics_handle = metrics_handle();
 
     let runtime = Runtime::builder(cfg).meter(meter).build()?;
     let state = AppState {
@@ -82,32 +90,16 @@ async fn main() -> anyhow::Result<()> {
     // Single-machine deploys (Fly volumes attach to one machine) can run
     // the control plane in this process, sharing the engine so both sides
     // agree on the `.cwasm` compatibility hash.
-    if env_nonempty("WARPLINE_EMBED_CONTROL").is_some_and(|v| v == "1") {
-        match state.runtime.gc(GC_GRACE_PERIOD).await {
-            Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
-            Err(e) => tracing::warn!(error = %e, "startup GC failed"),
-        }
-        let mut control_state =
-            warpline_control::AppState::new(state.runtime.clone(), state.auth.clone());
-        control_state.admin_token = env_nonempty("WARPLINE_ADMIN_TOKEN");
-        let default_control_bind = if insecure_dev {
-            "127.0.0.1:8081"
-        } else {
-            "0.0.0.0:8081"
-        };
-        let control_bind = env_nonempty("WARPLINE_CONTROL_BIND")
-            .unwrap_or_else(|| default_control_bind.to_string());
-        let control_listener = tokio::net::TcpListener::bind(&control_bind).await?;
-        tracing::info!(%control_bind, "embedded warpline-control starting");
-        let control_app = warpline_control::router(control_state);
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(control_listener, control_app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-            {
-                tracing::error!(error = %e, "embedded control listener failed");
-            }
-        });
+    let embed = env_nonempty("WARPLINE_EMBED_CONTROL").is_some_and(|v| v == "1");
+    #[cfg(feature = "embed-control")]
+    let control_task = if embed {
+        Some(spawn_embedded_control(&state, insecure_dev).await?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "embed-control"))]
+    if embed {
+        tracing::warn!("WARPLINE_EMBED_CONTROL=1 ignored: built without the embed-control feature");
     }
 
     // InsecureDev has no auth in front of it; don't default to a
@@ -124,12 +116,58 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // The control task got the same signal; give it a bounded time to drain
+    // (an upload may be mid-flight) rather than dropping it with the runtime.
+    #[cfg(feature = "embed-control")]
+    if let Some(task) = control_task {
+        if tokio::time::timeout(CONTROL_SHUTDOWN_TIMEOUT, task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("embedded control did not stop within {CONTROL_SHUTDOWN_TIMEOUT:?}");
+        }
+    }
+
     // Graceful shutdown waited for in-flight requests, so everything they
     // recorded is queued: flush it, bounded.
     if let Some(h) = meter_handle {
         h.shutdown(Duration::from_secs(5)).await;
     }
     Ok(())
+}
+
+/// Run the control plane on `WARPLINE_CONTROL_BIND`, sharing `state`'s
+/// runtime. The returned task ends when the shutdown signal arrives and
+/// in-flight requests finish.
+#[cfg(feature = "embed-control")]
+async fn spawn_embedded_control(
+    state: &AppState,
+    insecure_dev: bool,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    match state.runtime.gc(warpline_core::GC_GRACE_PERIOD).await {
+        Ok(removed) => tracing::info!(removed, "startup GC: removed unreferenced module blobs"),
+        Err(e) => tracing::warn!(error = %e, "startup GC failed"),
+    }
+    let mut control_state =
+        warpline_control::AppState::new(state.runtime.clone(), state.auth.clone());
+    control_state.admin_token = env_nonempty("WARPLINE_ADMIN_TOKEN");
+    let default_bind = if insecure_dev {
+        "127.0.0.1:8081"
+    } else {
+        "0.0.0.0:8081"
+    };
+    let bind = env_nonempty("WARPLINE_CONTROL_BIND").unwrap_or_else(|| default_bind.to_string());
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(control_bind = %bind, "embedded warpline-control starting");
+    let app = warpline_control::router(control_state);
+    Ok(tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
+            tracing::error!(error = %e, "embedded control listener failed");
+        }
+    }))
 }
 
 /// An environment variable, treating empty as unset.
@@ -155,12 +193,7 @@ async fn connect_auth() -> anyhow::Result<Option<Authenticator>> {
         );
         return Ok(None);
     };
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        // Fail fast rather than queueing every request behind a saturated pool.
-        .acquire_timeout(Duration::from_secs(2))
-        .connect(&url)
-        .await?;
+    let pool = pg::connect(&url).await?;
     pg::migrate(&pool).await?;
     let ttl = env_nonempty("WARPLINE_AUTH_CACHE_TTL_SECS")
         .and_then(|s| s.parse::<u64>().ok())

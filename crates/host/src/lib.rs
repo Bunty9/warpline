@@ -64,13 +64,17 @@ static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Installs the global Prometheus recorder exactly once per process and
 /// returns its handle. `metrics::set_global_recorder` can only succeed
 /// once, so every test that builds its own [`AppState`] calls this rather
-/// than reaching for `PrometheusBuilder` directly.
+/// than reaching for `PrometheusBuilder` directly. If some other recorder
+/// is already installed (an embedding app's), this logs a warning and
+/// returns a handle that renders nothing rather than panicking.
 pub fn metrics_handle() -> PrometheusHandle {
     METRICS
-        .get_or_init(|| {
-            PrometheusBuilder::new()
-                .install_recorder()
-                .expect("install prometheus recorder")
+        .get_or_init(|| match PrometheusBuilder::new().install_recorder() {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::warn!(error = %e, "a metrics recorder is already installed; /metrics will be empty");
+                PrometheusBuilder::new().build_recorder().handle()
+            }
         })
         .clone()
 }

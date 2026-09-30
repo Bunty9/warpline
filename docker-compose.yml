@@ -29,7 +29,7 @@ services:
       - "8080:8080"
     volumes:
       # Shared with warpline-control — the host reads `.cwasm`s and pointer
-      # files the control plane writes; see `warpline_core::registry`.
+      # files the control plane writes; see the module registry in `warpline-core`.
       - modules_data:/var/lib/warpline/modules
     entrypoint: ["/usr/local/bin/warpline-host"]
 
@@ -44,7 +44,7 @@ services:
       WARPLINE_MODULES_DIR: /var/lib/warpline/modules
       # Placeholder — replace before any non-local deployment. Bearer token
       # for POST /admin/tenants/{tenant}; unset (or empty) disables the
-      # route entirely (404). See `warpline_control::AppState::new`.
+      # route entirely (404). See `warpline_control::AppState`.
       WARPLINE_ADMIN_TOKEN: change-me
       RUST_LOG: info
     ports:

@@ -4,7 +4,13 @@
 > customised for P6 (warpline) bench targets and the Phase C sequencing
 > in `backend-cloud-roadmap.md` § 2 (weeks 39–44).
 
-## Sprint — Phase 1 scaffold
+## Sprint — Phase 1 scaffold (historical)
+
+> **Historical.** This is the original scaffold checklist, kept as a record.
+> It describes the Phase-1 layout (`wasm32-wasip1`, MinIO in compose, a
+> `meter.rs` that inserted directly) which no longer exists: see Phase 2 and
+> "0.2 — embeddable runtime" below for the current shape. Unchecked items
+> here were superseded, not left undone.
 
 - [x] `Cargo.toml` — workspace root, members `[core, host, control]`,
       `examples/hello-wasm` excluded (wasm32 target conflict)
@@ -17,10 +23,12 @@
       standalone guest crate (not in workspace)
 - [x] `migrations/0001_init.sql` — tenants + functions + meter tables
 - [x] `Dockerfile` — cargo-chef multi-stage, distroless `cc-debian12`
-- [x] `docker-compose.yml` — postgres + minio + host + control
+- [x] `docker-compose.yml` — postgres + host + control (Phase 1 planned a
+      MinIO service too; it was never added, see README "Roadmap")
 - [x] `fly.toml` — single region `sin`
 - [x] `.github/workflows/ci.yml` — fmt + clippy + nextest + deny + bench
-      + `build-wasm-example` (installs `wasm32-wasip1`)
+      + `build-wasm-example` (Phase 1 installed `wasm32-wasip1`; guests now
+      build for `wasm32-wasip2`)
 - [x] `deny.toml`, `rust-toolchain.toml`, `.gitignore`
 - [x] `README.md`, design spec, phase plan
 - [x] `cargo check --workspace` passes locally (verified at end of scaffold)
@@ -51,12 +59,12 @@
       instead of a direct `meter::record` call (or a per-invoke
       `tokio::spawn`), completed invocations are queued onto a bounded
       `mpsc` channel to a single writer task that batches inserts
-      (`meter::spawn_writer`, `METER_CHANNEL_CAPACITY = 10_000`,
-      `BATCH_MAX = 200`) — bounded backpressure under a burst instead of
+      (then `meter::spawn_writer`; since 0.2 `pg::PgMeter::spawn`, capacity
+      10,000, batches of up to 200) — bounded backpressure under a burst instead of
       one Postgres write and one spawned task per request.
 - [x] `TenantLimiter` moved into `HostCtx` (no `Box::leak`); doubles as the
       peak-memory recorder metering reads.
-- [x] Module registry: `warpline_core::registry` — pointer files
+- [x] Module registry: `registry` module in `warpline-core` (private since 0.2) — pointer files
       (`modules/tenants/{tenant}/{func}`) resolved to a content digest,
       backed by an in-memory `ComponentCache` LRU (256 entries / 512 MiB
       byte budget). **Deviated from the plan**: the source `.wasm` is also
@@ -88,6 +96,31 @@
       above: the epoch ticker now sleeps to an absolute schedule instead of
       a relative `sleep(tick)` per iteration (see "Notes on the misses"
       below).
+
+## 0.2 — embeddable runtime
+
+Source of requirements: the 2026-09-30 audit; plan in
+`docs/plans/2026-09-30-warpline-0.2-embedding.md`. Tasks 1-3 of 5 done on
+`release/0.2`:
+
+- [x] **Task 1** — `warpline_core::pg` (feature `postgres`): schema-isolated
+      `pg::migrate`, `Authenticator`, tenant admin (`create_tenant`,
+      `patch_tenant`, `set_limits`, `tenant_limits`, `usage_summary`),
+      batching `PgMeter` with a drop counter and bounded shutdown.
+- [x] **Task 2** — `Runtime` facade with `RuntimeConfig`/`RuntimeBuilder`:
+      `stage`/`activate`/`publish`/`invoke`/`gc`, memory admission budget
+      (`503`), per-tenant in-flight cap (`429`), output cap (`502`),
+      epoch-tick metering, compile permits, typed errors with
+      `InvokeError::http_status`.
+- [x] **Task 3** — `warpline-host` and `warpline-control` are thin HTTP
+      layers over `Runtime` + `pg`: environment handling only in `main.rs`
+      (empty means unset), control shuts down gracefully, upload activates
+      the pointer inside the quota transaction and restores the previous one
+      if the commit fails, admin bodies have PATCH semantics, host embeds
+      control behind the `embed-control` feature and awaits it with a
+      timeout on shutdown, README embedding section and doc fixes.
+- [ ] **Task 4** — `examples/storefront` reference app.
+- [ ] **Task 5** — version bump, changelog, trusted-publishing release.
 
 ## Next sprint — Phase 3
 
@@ -148,7 +181,7 @@ warpline-core` (release profile: `lto = "fat"`, `codegen-units = 1`),
   Cause: the epoch ticker slept a relative 1 ms per iteration; every sleep
   overshoots slightly and budgets are counted in ticks, so the drift
   compounded (~0.12 ms/tick). The ticker now sleeps to an absolute
-  schedule (`crates/core/src/runtime.rs`, `EpochTicker::spawn`), which
+  schedule (`crates/core/src/sandbox.rs`, `EpochTicker::spawn`), which
   brought all three budgets within ±0.7 ms.
 - **Cost-per-million is a compute-bound ceiling, not a real quote.** It's
   derived from the single-core echo throughput above, which does zero real

@@ -51,7 +51,9 @@ async fn main() -> anyhow::Result<()> {
     let bind = env_nonempty("WARPLINE_CONTROL_BIND").unwrap_or_else(|| default_bind.to_string());
     tracing::info!(%bind, "warpline-control starting");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -77,15 +79,36 @@ async fn connect_auth() -> anyhow::Result<Option<Authenticator>> {
         );
         return Ok(None);
     };
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        // Fail fast rather than queueing every request behind a saturated pool.
-        .acquire_timeout(Duration::from_secs(2))
-        .connect(&url)
-        .await?;
+    let pool = pg::connect(&url).await?;
     pg::migrate(&pool).await?;
     let ttl = env_nonempty("WARPLINE_AUTH_CACHE_TTL_SECS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(30);
     Ok(Some(Authenticator::new(pool, Duration::from_secs(ttl))))
+}
+
+/// Resolves on ctrl-c or SIGTERM (what container orchestrators send), so an
+/// upload in progress finishes before the server stops.
+// ponytail: same 15 lines as `warpline_host::shutdown_signal`; control cannot
+// depend on host, so it is duplicated rather than moved into core.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl-c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

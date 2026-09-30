@@ -10,9 +10,9 @@
 //!   `publish_pointer`).
 //! - `POST /admin/tenants/{tenant}` (guarded by the admin token) creates a
 //!   tenant idempotently, optionally sets its resource limits, and issues a
-//!   new API key via `warpline_core::pg::create_tenant` (one transaction).
-//!   Fields left out of the body take the default limits when a body is
-//!   sent at all.
+//!   new API key via `warpline_core::pg::patch_tenant` (one transaction).
+//!   PATCH semantics: fields left out of the body keep the tenant's current
+//!   values (defaults for a new tenant); they are never reset.
 //! - `GET /healthz`.
 //!
 //! Split into this lib (state + [`router`]) and a thin `main.rs` so
@@ -28,7 +28,7 @@ use axum::{
     Router,
 };
 use warpline_core::{
-    pg::{self, AdminError, AuthOutcome, Authenticator},
+    pg::{self, AdminError, AuthOutcome, Authenticator, LimitsPatch},
     types::{parse_bearer, valid_name, validate_cpu_budget_ms, validate_mem_cap_bytes},
     Limits, PublishError, Runtime, Staged,
 };
@@ -194,31 +194,25 @@ async fn upload(
         .into_response()
 }
 
-/// Publish `(tenant, func)` -> `wasm_digest`.
+/// Publish `(tenant, func)` -> `staged`.
 ///
 /// In DB mode (finding 10): one transaction takes a per-*tenant* advisory
 /// lock, enforces [`AppState::max_functions_per_tenant`] (finding 3), and
-/// upserts the `functions` row — all before committing, so a quota
-/// rejection or any DB failure never leaves a `functions` row behind that
-/// the pointer file doesn't back.
+/// upserts the `functions` row.
 ///
 /// The lock is keyed on `tenant` alone, not `(tenant, func)` (finding 5):
 /// two concurrent uploads of two different *new* function names for the
 /// same tenant must serialize against each other too, or both can read the
-/// same `count(*)` before either inserts and both pass the quota check —
-/// only a lock that's shared across every upload for a tenant closes that
-/// race.
+/// same `count(*)` before either inserts and both pass the quota check.
 ///
-/// The pointer file is written *after* `tx.commit()`, not before (finding
-/// 6): the advisory lock is released at commit, so a concurrent upload of
-/// the *same* `(tenant, func)` could in principle commit its own
-/// `functions` row and then race this one on the pointer write — acceptable,
-/// last writer wins, and it's the same outcome a sequential re-upload would
-/// have anyway. Writing the pointer post-commit instead means a commit
-/// failure (or a crash between the two) never leaves a pointer that serves
-/// new code without a `functions` row backing it; the reverse case (a row
-/// with no pointer yet) just 404s until the write is retried, which is the
-/// harmless direction to fail in.
+/// The pointer is switched *inside* the transaction, before the commit, so
+/// the lock is still held: two uploads of the same `(tenant, func)` cannot
+/// interleave, and the pointer always ends up matching the last committed
+/// row. If the commit then fails, the previous pointer is put back (or
+/// removed, if there was none) by [`restore_pointer`]. A crash between
+/// activate and commit can still leave the pointer ahead of the row; the
+/// pointer is what invokes read, so the function serves the new code and the
+/// next upload repairs the row.
 ///
 /// Without a database (dev mode), there is nothing to lock or upsert
 /// against, so this just writes the pointer.
@@ -228,21 +222,19 @@ async fn publish_pointer(
     func: &str,
     staged: &Staged,
 ) -> Result<(), (StatusCode, String)> {
-    let activate = || async {
-        state
+    let pointer_error = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::error!(%tenant, %func, error = %e, "{what}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to publish module".to_string(),
+        )
+    };
+    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
+        return state
             .runtime
             .activate(tenant, func, staged)
             .await
-            .map_err(|e| {
-                tracing::error!(%tenant, %func, error = %e, "failed to write pointer");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to publish module".to_string(),
-                )
-            })
-    };
-    let Some(pool) = state.auth.as_ref().map(Authenticator::pool) else {
-        return activate().await;
+            .map_err(|e| pointer_error("failed to write pointer", &e));
     };
 
     let internal_error = |e: sqlx::Error, action: &str| {
@@ -305,14 +297,47 @@ async fn publish_pointer(
     .await
     .map_err(|e| internal_error(e, "failed to upsert functions row"))?;
 
-    tx.commit()
+    let previous = state
+        .runtime
+        .active(tenant, func)
         .await
-        .map_err(|e| internal_error(e, "failed to commit publish transaction"))?;
+        .map_err(|e| pointer_error("failed to read current pointer", &e))?;
+    state
+        .runtime
+        .activate(tenant, func, staged)
+        .await
+        .map_err(|e| pointer_error("failed to write pointer", &e))?;
 
-    // Written after the commit, not before (finding 6) — see doc comment
-    // above for why that ordering is the one that can't leave a pointer
-    // serving code the `functions` table doesn't know about.
-    activate().await
+    if let Err(e) = tx.commit().await {
+        restore_pointer(&state.runtime, tenant, func, previous).await;
+        return Err(internal_error(e, "failed to commit publish transaction"));
+    }
+    Ok(())
+}
+
+/// Undo an [`activate`](Runtime::activate) whose transaction did not commit:
+/// point `(tenant, func)` back at `previous`, or remove the pointer if there
+/// was none. Failures are logged; there is nothing further to fall back on.
+#[doc(hidden)]
+pub async fn restore_pointer(
+    runtime: &Runtime,
+    tenant: &str,
+    func: &str,
+    previous: Option<Staged>,
+) {
+    let result = match &previous {
+        Some(prev) => runtime
+            .activate(tenant, func, prev)
+            .await
+            .map_err(|e| e.to_string()),
+        None => runtime
+            .deactivate(tenant, func)
+            .await
+            .map_err(|e| e.to_string()),
+    };
+    if let Err(e) = result {
+        tracing::error!(%tenant, %func, error = %e, "could not restore previous pointer");
+    }
 }
 
 /// `POST /admin/tenants/{tenant}` request body — every field optional, so a
@@ -370,36 +395,25 @@ async fn admin_create_tenant(
             }
         }
     };
-    // No fields -> leave an existing tenant's limits alone. Otherwise the
-    // body describes the tenant's limits, unspecified fields at defaults.
-    // Range checks run on the raw i64s so negatives get a proper 400;
-    // `create_tenant` validates hosts again and stores them normalised.
-    let limits = if cfg.allowed_hosts.is_none()
-        && cfg.cpu_budget_ms.is_none()
-        && cfg.mem_cap_bytes.is_none()
-    {
-        None
-    } else {
-        let mut l = Limits::default();
-        if let Some(ms) = cfg.cpu_budget_ms {
-            if let Err(e) = validate_cpu_budget_ms(ms) {
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-            }
-            l.cpu_budget_ms = ms as u64;
+    // PATCH semantics: only the fields present in the body change. Range
+    // checks run on the raw i64s so negatives get a proper 400;
+    // `patch_tenant` validates again and stores hosts normalised.
+    let mut patch = LimitsPatch::default();
+    if let Some(ms) = cfg.cpu_budget_ms {
+        if let Err(e) = validate_cpu_budget_ms(ms) {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
-        if let Some(b) = cfg.mem_cap_bytes {
-            if let Err(e) = validate_mem_cap_bytes(b) {
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-            }
-            l.mem_cap_bytes = b as usize;
+        patch.cpu_budget_ms = Some(ms as u64);
+    }
+    if let Some(b) = cfg.mem_cap_bytes {
+        if let Err(e) = validate_mem_cap_bytes(b) {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
-        if let Some(hosts) = cfg.allowed_hosts {
-            l.allowed_hosts = hosts;
-        }
-        Some(l)
-    };
+        patch.mem_cap_bytes = Some(b as usize);
+    }
+    patch.allowed_hosts = cfg.allowed_hosts;
 
-    match pg::create_tenant(pool, &tenant, limits.as_ref()).await {
+    match pg::patch_tenant(pool, &tenant, &patch).await {
         Ok(key) => {
             tracing::info!(%tenant, "tenant created/updated, api key issued");
             (
@@ -424,7 +438,35 @@ async fn admin_create_tenant(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, restore_pointer};
+    use warpline_core::{Bytes, Runtime, RuntimeConfig};
+
+    const GUEST: &[u8] = include_bytes!("../../core/tests/fixtures/test_guest.wasm");
+
+    /// The commit-failure path: the pointer goes back to what it was, or
+    /// disappears when there was none.
+    #[tokio::test]
+    async fn restore_pointer_undoes_an_activate() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime::new(RuntimeConfig::new(dir.path())).unwrap();
+        let first = rt
+            .publish("t", "f", Bytes::from_static(GUEST))
+            .await
+            .unwrap();
+
+        // A different component to "activate before the failed commit".
+        let mut other = GUEST.to_vec();
+        other.extend_from_slice(&[0, 3, 1, b'x', 0]); // custom section: new digest
+        let second = rt.stage(Bytes::from(other)).await.unwrap();
+        assert_ne!(first, second);
+
+        rt.activate("t", "f", &second).await.unwrap();
+        restore_pointer(&rt, "t", "f", Some(first.clone())).await;
+        assert_eq!(rt.active("t", "f").await.unwrap(), Some(first));
+
+        restore_pointer(&rt, "t", "f", None).await;
+        assert_eq!(rt.active("t", "f").await.unwrap(), None);
+    }
 
     #[test]
     fn constant_time_eq_matches_regular_equality() {
