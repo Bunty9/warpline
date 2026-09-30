@@ -77,7 +77,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # In-memory component LRU (`core::registry::ComponentCache`).
 lru = "0.18"
 # 32-byte API key generation (`warpline-control`'s admin route).
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Bench harness (Task 3, `crates/core/benches/*`).
 criterion = "0.5"
