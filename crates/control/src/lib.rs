@@ -296,6 +296,15 @@ async fn publish_in_db(
     // Serialize concurrent uploads for the same *tenant* (not just the same
     // func — see doc comment above) so the quota check below can't race
     // with itself.
+    // Bound every wait so a DB partition cannot hang the request forever.
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal_error(e, "failed to set publish timeouts"))?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal_error(e, "failed to set publish timeouts"))?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(tenant)
         .execute(&mut *tx)
@@ -369,6 +378,13 @@ async fn try_reconcile(
     func: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tx = pool.begin().await?;
+    // Bound every wait so a DB partition cannot hang the request forever.
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(tenant)
         .execute(&mut *tx)

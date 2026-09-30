@@ -223,9 +223,10 @@ async fn overload_and_tenant_busy_map_to_503_and_429() {
         let busy = busy.clone();
         tokio::spawn(async move {
             // A poll below may briefly hold the slot; retry until we get it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let res = invoke(&busy, "acme", "echo", b"loop").await;
-                if res.0 != StatusCode::TOO_MANY_REQUESTS {
+                if res.0 != StatusCode::TOO_MANY_REQUESTS || std::time::Instant::now() >= deadline {
                     return res;
                 }
             }

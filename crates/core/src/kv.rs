@@ -60,8 +60,8 @@ pub trait KvStore: Send + Sync {
 #[derive(Default)]
 struct MemKvInner {
     entries: HashMap<(String, String), Vec<u8>>,
-    /// Running total of key + value + per-entry overhead bytes stored per tenant — kept in the same
-    /// lock as `entries` so a put's quota check and its write are atomic.
+    /// Running total of key + value + per-entry overhead bytes stored per
+    /// tenant — kept in the same lock as `entries` so a put's quota check and its write are atomic.
     tenant_bytes: HashMap<String, usize>,
 }
 

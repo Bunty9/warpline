@@ -356,15 +356,25 @@ impl Runtime {
 
     /// Point `(tenant, func)` at a component that was staged earlier, given
     /// only its digest (e.g. read back from a database row). Errors if no
-    /// source blob for `digest` exists.
+    /// source blob for `digest` exists ([`Error::NotFound`] inside
+    /// [`PublishError::Registry`]), the digest is malformed, or a name is
+    /// invalid ([`PublishError::InvalidName`]).
     pub async fn activate_digest(
         &self,
         tenant: &str,
         func: &str,
         digest: &str,
     ) -> Result<(), PublishError> {
+        if !valid_name(tenant) || !valid_name(func) {
+            return Err(PublishError::InvalidName);
+        }
+        if !cache::is_valid_digest(digest) {
+            return Err(PublishError::Registry(Error::Corrupt(
+                "invalid digest: expected 64 lowercase hex characters".into(),
+            )));
+        }
         if !registry::wasm_exists(&self.0.cfg.modules_dir, digest) {
-            return Err(PublishError::Registry(Error::Corrupt(format!(
+            return Err(PublishError::Registry(Error::NotFound(format!(
                 "no staged component with digest {digest}"
             ))));
         }

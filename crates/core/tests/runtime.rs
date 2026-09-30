@@ -803,3 +803,41 @@ async fn active_and_deactivate_round_trip() {
     rt.activate("tenant-a", FN, &active).await.unwrap();
     assert_eq!(rt.active("tenant-a", FN).await.unwrap(), Some(active));
 }
+
+#[tokio::test]
+async fn activate_digest_validates_names_digest_and_blob() {
+    use warpline_core::Error;
+    let (rt, _dir) = setup_with(&[], |_| {}).await;
+    let staged = rt.stage(Bytes::from_static(TEST_GUEST_WASM)).await.unwrap();
+
+    // Bad name wins over everything else.
+    let err = rt
+        .activate_digest("Bad Name", FN, "nope")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PublishError::InvalidName), "{err:?}");
+    // Malformed digest.
+    let err = rt
+        .activate_digest("tenant-a", FN, "../x")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PublishError::Registry(Error::Corrupt(_))),
+        "{err:?}"
+    );
+    // Well-formed digest with no source blob.
+    let err = rt
+        .activate_digest("tenant-a", FN, &"0".repeat(64))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PublishError::Registry(Error::NotFound(_))),
+        "{err:?}"
+    );
+    assert!(rt.active("tenant-a", FN).await.unwrap().is_none());
+    // A staged digest works.
+    rt.activate_digest("tenant-a", FN, &staged.digest)
+        .await
+        .unwrap();
+    assert_eq!(rt.active("tenant-a", FN).await.unwrap(), Some(staged));
+}

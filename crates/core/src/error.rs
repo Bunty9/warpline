@@ -15,6 +15,9 @@ pub enum Error {
     /// `.cwasm` and no source `.wasm` for a digest, ...).
     #[error("corrupt or missing module state: {0}")]
     Corrupt(String),
+    /// A module the caller named (by digest) is not in the registry.
+    #[error("not found: {0}")]
+    NotFound(String),
     /// A [`RuntimeConfig`](crate::RuntimeConfig) value is out of range.
     #[error("invalid configuration: {0}")]
     Config(&'static str),

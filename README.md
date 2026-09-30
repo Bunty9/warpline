@@ -176,7 +176,7 @@ defaults shown.
 | KV value size (per `put`)                       | 1 MiB                                             | `kv::Host::put` |
 | KV `put` calls per invocation                   | 1,000                                             | `HostCtx::kv_put_count` |
 | KV `put` bytes per invocation                   | 8 MiB                                             | `HostCtx::kv_put_bytes` |
-| KV storage per tenant (`MemKv`)                 | 16 MiB                                            | `kv::DEFAULT_TENANT_CAP_BYTES` |
+| KV storage per tenant (`MemKv`)                 | 16 MiB                                            | `kv::DEFAULT_TENANT_CAP_BYTES`; counts key + value + 64 B per entry |
 | Log line length                                 | 4 KiB (truncated, not trapped)                    | `log::Host::emit` |
 | Log lines per invocation                        | 100 (dropped after, one "suppressed" notice)      | `log::Host::emit` |
 | Log bytes per invocation                        | 64 KiB                                            | `log::Host::emit` |
@@ -188,7 +188,7 @@ defaults shown.
 | `http-out` private/loopback/link-local targets  | blocked unless `WARPLINE_ALLOW_PRIVATE_EGRESS=1`  | `is_blocked_ip`, `GuardedResolver` |
 | Upload body (`.wasm`)                           | 16 MiB                                            | `UPLOAD_BODY_LIMIT_BYTES` |
 | Invoke request body                             | 1 MiB                                             | `INVOKE_BODY_LIMIT_BYTES` |
-| Functions per tenant                            | 100                                               | `DEFAULT_MAX_FUNCTIONS_PER_TENANT` (`warpline-control`), enforced in the publish transaction, so **only with Postgres** (`WARPLINE_INSECURE_DEV=1` has no quota) |
+| Functions per tenant                            | 100                                               | `warpline_control::AppState::max_functions_per_tenant` (default 100), enforced in the publish transaction, so **only with Postgres** (`WARPLINE_INSECURE_DEV=1` has no quota) |
 | Compile concurrency (process-wide)              | `max(available_parallelism / 2, 1)` permits       | `RuntimeConfig::compile_concurrency` |
 | In-memory component cache                       | 256 entries, 512 MiB total serialized bytes       | `RuntimeConfig::component_cache_entries` / `component_cache_bytes` |
 | Epoch tick                                      | 1 ms                                              | `sandbox::EpochTicker`, `EPOCH_TICK_MS` |
