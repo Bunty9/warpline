@@ -600,11 +600,10 @@ pub(crate) async fn run(
         let mut store = Store::new(pre.engine(), ctx);
         store.limiter(|c| &mut c.limiter as &mut dyn ResourceLimiter);
 
-        // One tick at a time: on every epoch tick that reaches the deadline,
-        // count it, yield to the tokio executor and extend the deadline by
-        // one more tick. The deadline is re-based after each yield, so time
-        // spent waiting to be re-polled is not counted. One extra tick is
-        // allowed past the budget: the first tick is a partial one.
+        // One tick at a time: count each tick that reaches the deadline,
+        // yield to the tokio executor and extend the deadline by one tick.
+        // The deadline is re-based after each yield, so time spent waiting to
+        // be re-polled is not counted. Limits: see `call_limit`.
         let limit = Arc::new(AtomicU64::new(budget_ticks + INSTANTIATE_GRACE_TICKS));
         let (ticks_cb, limit_cb) = (ticks.clone(), limit.clone());
         store.epoch_deadline_callback(move |_store| {
@@ -729,6 +728,12 @@ mod tests {
                 assert!(total <= budget + G, "budget {budget} used {used}");
                 assert!(total >= budget, "budget {budget} used {used}");
             }
+            // Exact values, so an off-by-one in either direction fails.
+            assert_eq!(call_limit(0, budget), budget);
+            assert_eq!(call_limit(1, budget), budget + 1);
+            assert_eq!(call_limit(2, budget), budget + 2);
+            assert_eq!(call_limit(50, budget), budget + 2);
         }
+        assert_eq!(G, 2, "the exact values above assume a grace of 2 ticks");
     }
 }

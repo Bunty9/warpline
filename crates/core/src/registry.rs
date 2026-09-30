@@ -164,6 +164,12 @@ pub(crate) enum Lookup {
     Miss(String),
 }
 
+/// Result of [`ComponentCache::load_existing`].
+pub(crate) enum Loaded {
+    Ready(Arc<HandlerPre<HostCtx>>),
+    NeedsCompile,
+}
+
 struct ComponentCacheInner {
     lru: LruCache<String, CacheEntry>,
     total_bytes: usize,
@@ -247,6 +253,17 @@ impl ComponentCache {
     // for their own recompile. Add a per-digest in-flight map if that shows
     // up as real load.
     pub(crate) fn get_or_load(&self, digest: &str) -> Result<Arc<HandlerPre<HostCtx>>, Error> {
+        match self.load_existing(digest)? {
+            Loaded::Ready(pre) => Ok(pre),
+            Loaded::NeedsCompile => self.recompile(digest),
+        }
+    }
+
+    /// The cheap part of [`get_or_load`](Self::get_or_load), needing no
+    /// compile permit: the LRU, then deserialising the on-disk `.cwasm`.
+    /// [`Loaded::NeedsCompile`] means the `.cwasm` is missing, corrupt or
+    /// built for another engine.
+    pub(crate) fn load_existing(&self, digest: &str) -> Result<Loaded, Error> {
         if let Some(hit) = self
             .inner
             .lock()
@@ -255,44 +272,49 @@ impl ComponentCache {
             .get(digest)
             .map(|e| e.pre.clone())
         {
-            return Ok(hit);
+            return Ok(Loaded::Ready(hit));
         }
 
         let cwasm_dir = cwasm_dir(&self.modules_dir);
-        let (component, weight) = match cache::load_cwasm(&self.engine, &cwasm_dir, digest) {
-            Ok(c) => {
-                let weight =
-                    std::fs::metadata(cwasm_dir.join(cache::cache_file_name(&self.engine, digest)))
-                        .map(|m| m.len() as usize)
-                        .unwrap_or(0);
-                (c, weight)
-            }
+        let component = match cache::load_cwasm(&self.engine, &cwasm_dir, digest) {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
                     digest,
                     error = %e,
                     "cwasm cache miss/corrupt, recompiling from stored source"
                 );
-                let wasm_bytes =
-                    std::fs::read(wasm_path(&self.modules_dir, digest)).map_err(|_| {
-                        Error::Corrupt(format!(
-                            "no cwasm and no source wasm on disk for digest {digest}"
-                        ))
-                    })?;
-                let component = Component::new(&self.engine, &wasm_bytes)?;
-                let weight =
-                    match cache::persist_cwasm(&component, &self.engine, &cwasm_dir, digest) {
-                        Ok(len) => len,
-                        Err(e) => {
-                            tracing::warn!(
-                                digest,
-                                error = %e,
-                                "could not re-publish recompiled .cwasm; serving from memory"
-                            );
-                            wasm_bytes.len()
-                        }
-                    };
-                (component, weight)
+                return Ok(Loaded::NeedsCompile);
+            }
+        };
+        let weight =
+            std::fs::metadata(cwasm_dir.join(cache::cache_file_name(&self.engine, digest)))
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+        let pre = Arc::new(crate::sandbox::instantiate_pre(&self.linker, &component)?);
+        self.insert(digest, pre.clone(), weight);
+        Ok(Loaded::Ready(pre))
+    }
+
+    /// Recompile `digest` from the stored source `.wasm` and re-publish a
+    /// fresh `.cwasm`. CPU-heavy: callers hold a compile permit.
+    pub(crate) fn recompile(&self, digest: &str) -> Result<Arc<HandlerPre<HostCtx>>, Error> {
+        let cwasm_dir = cwasm_dir(&self.modules_dir);
+        let wasm_bytes = std::fs::read(wasm_path(&self.modules_dir, digest)).map_err(|_| {
+            Error::Corrupt(format!(
+                "no cwasm and no source wasm on disk for digest {digest}"
+            ))
+        })?;
+        let component = Component::new(&self.engine, &wasm_bytes)?;
+        let weight = match cache::persist_cwasm(&component, &self.engine, &cwasm_dir, digest) {
+            Ok(len) => len,
+            Err(e) => {
+                tracing::warn!(
+                    digest,
+                    error = %e,
+                    "could not re-publish recompiled .cwasm; serving from memory"
+                );
+                wasm_bytes.len()
             }
         };
         let pre = Arc::new(crate::sandbox::instantiate_pre(&self.linker, &component)?);

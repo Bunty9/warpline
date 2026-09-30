@@ -20,7 +20,7 @@ use wasmtime::Engine;
 
 use crate::cache;
 use crate::kv::{KvStore, MemKv};
-use crate::registry::{self, ComponentCache, Lookup};
+use crate::registry::{self, ComponentCache, Loaded, Lookup};
 use crate::sandbox::{self, EpochTicker, Failure};
 use crate::types::{valid_name, HostCtx};
 use crate::{Error, InvokeError, Limits, MeterSink, PublishError, Usage};
@@ -398,32 +398,49 @@ impl Runtime {
                 Lookup::NotFound => return Err(InvokeError::NotFound),
                 Lookup::Hit(pre) => pre,
                 Lookup::Miss(digest) => {
-                    // Take the compile permit here, asynchronously, and move
-                    // it into the blocking task: a blocking thread must never
-                    // wait for a permit, or a burst of misses could park the
-                    // whole blocking pool while the permit holders (stages)
-                    // wait for a thread.
-                    let permit =
-                        inner
-                            .compile_slots
-                            .clone()
-                            .acquire_owned()
+                    // Cheap path first, with no permit: deserialise the
+                    // `.cwasm` on disk. Only when it needs a real compile do
+                    // we queue for one, so a restart does not serialise cold
+                    // loads behind in-flight stages.
+                    let loaded = {
+                        let (inner, digest) = (inner.clone(), digest.clone());
+                        tokio::task::spawn_blocking(move || inner.components.load_existing(&digest))
                             .await
-                            .map_err(|_| {
-                                InvokeError::Load(Error::Internal(
-                                    "compile semaphore closed".into(),
-                                ))
-                            })?;
-                    let inner = inner.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        inner.components.get_or_load(&digest)
-                    })
-                    .await
-                    .map_err(|e| {
-                        InvokeError::Load(Error::Internal(format!("load task failed: {e}")))
-                    })?
-                    .map_err(InvokeError::Load)?
+                            .map_err(|e| {
+                                InvokeError::Load(Error::Internal(format!("load task failed: {e}")))
+                            })?
+                            .map_err(InvokeError::Load)?
+                    };
+                    match loaded {
+                        Loaded::Ready(pre) => pre,
+                        Loaded::NeedsCompile => {
+                            // The permit is taken here, asynchronously, and
+                            // moved into the blocking task: a blocking thread
+                            // must never wait for a permit, or a burst of
+                            // misses could park the whole blocking pool while
+                            // the permit holders (stages) wait for a thread.
+                            let permit =
+                                inner.compile_slots.clone().acquire_owned().await.map_err(
+                                    |_| {
+                                        InvokeError::Load(Error::Internal(
+                                            "compile semaphore closed".into(),
+                                        ))
+                                    },
+                                )?;
+                            let inner = inner.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                inner.components.get_or_load(&digest)
+                            })
+                            .await
+                            .map_err(|e| {
+                                InvokeError::Load(Error::Internal(format!(
+                                    "recompile task failed: {e}"
+                                )))
+                            })?
+                            .map_err(InvokeError::Load)?
+                        }
+                    }
                 }
             }
         };
@@ -616,5 +633,33 @@ mod tests {
         drop(clone);
         assert!(stopped.load(Ordering::Relaxed), "ticker must stop");
         assert!(weak.upgrade().is_none(), "no leaked Arc<Inner>");
+    }
+
+    /// A cold LRU miss whose `.cwasm` is on disk only deserialises: it must
+    /// not queue for a compile permit, even while a stage holds the only one.
+    #[tokio::test]
+    async fn cold_load_from_cwasm_does_not_wait_for_compile_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = RuntimeConfig::new(dir.path());
+        cfg.compile_concurrency = 1;
+        let first = Runtime::new(cfg.clone()).unwrap();
+        first
+            .publish("t", "f", Bytes::from_static(TEST_GUEST_WASM))
+            .await
+            .unwrap();
+        drop(first);
+
+        // Fresh runtime: empty LRU, cwasm on disk. Hold the only permit, as
+        // a long-running stage would.
+        let rt = Runtime::new(cfg).unwrap();
+        let _held = rt.0.compile_slots.clone().acquire_owned().await.unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            rt.invoke("t", "f", b"x".to_vec(), &Limits::default()),
+        )
+        .await
+        .expect("cold load queued behind the compile permit")
+        .unwrap();
+        assert_eq!(out.output, b"x");
     }
 }
