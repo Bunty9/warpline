@@ -145,6 +145,20 @@ items deferred out of Phase 2 (also tracked in README "Roadmap / deferred"):
       `warpline-core::invoke` directly — see the cost-per-million caveat
       below).
 
+### Known issues carried from the 0.2 reviews
+
+None block correct operation; all were triaged "later" in the final 0.2.0 review.
+
+- Auth during a Postgres outage: keys not already cached wait up to 2 s per request before failing (no circuit breaker).
+- Pointer/row divergence (rare: crash between activate and commit) plus pointer-based GC can delete a blob the `functions` row still references.
+- `ComponentCache::get_or_load` repeats `load_existing` under the compile permit; non-`NotFound` I/O errors on a `.cwasm` are treated as "needs compile"; normal cold starts log at warn.
+- Control: the 5 s `statement_timeout` turns a slow-DB upload into a 500 (503 would fit better); the `SET LOCAL` block sits under the advisory-lock comment.
+- `PgMeterHandle::shutdown` leaves the writer detached after its timeout instead of aborting it; meter warn backoff comment vs. firing pattern.
+- Tests don't assert negative auth-cache hits or that a meter retry happened.
+- `wat` dev-dependency duplicates `wasm-encoder`/`wasmparser` in dev builds.
+- `ci.yml` actions are pinned by tag, not SHA (`release.yml` is SHA-pinned); the CI `/healthz` wait accepts non-2xx.
+- Storefront example: `PgKv` shares the 10-connection pool with auth and metering and has no per-query timeout; the hook's counter is get-then-put (concurrent checkouts can lose an increment); `read_body` maps every error to 413; `build.sh` breaks on paths with spaces.
+
 ## Done
 
 - Phase 1 scaffold (see above) — workspace skeleton, stub host fns,
