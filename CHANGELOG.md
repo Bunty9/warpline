@@ -5,6 +5,22 @@ All notable changes to warpline are documented here. The format follows
 follows [Semantic Versioning](https://semver.org/) (0.x: minor releases may
 break).
 
+## [Unreleased]
+
+### Added
+
+- Prebuilt binaries on each GitHub release: `warpline-host` and
+  `warpline-control` for `x86_64`/`aarch64` Linux (glibc) and macOS, as
+  `warpline-vX.Y.Z-<target>.tar.gz` with a `SHA256SUMS` file and build
+  provenance attestations (`gh attestation verify`).
+- Multi-arch (linux/amd64, linux/arm64) container image at
+  `ghcr.io/bunty9/warpline`, tagged `X.Y.Z`, `X.Y`, `latest` and by commit
+  sha.
+- `[package.metadata.binstall]` on `warpline-host` and `warpline-control`, so
+  `cargo binstall` downloads the release archive.
+- `release` workflow can be run manually as a dry run that builds the
+  archives without publishing.
+
 ## [0.2.0] - 2026-09-30
 
 warpline-core is now embeddable: hold a `Runtime`, publish components and
@@ -125,5 +141,6 @@ First release.
   fixture reproducibility.
 - crates.io metadata and dual MIT/Apache-2.0 licensing.
 
+[Unreleased]: https://github.com/Bunty9/warpline/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/Bunty9/warpline/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bunty9/warpline/releases/tag/v0.1.0

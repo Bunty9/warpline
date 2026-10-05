@@ -14,6 +14,14 @@ readme = "../../README.md"
 # this package; ship without them rather than with tests that don't build.
 exclude = ["tests/"]
 
+# Prebuilt archive attached to the GitHub release (one archive holds both
+# binaries under a `warpline-v<version>-<target>/` directory; keep in sync with
+# the Package step in .github/workflows/release.yml).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/warpline-v{ version }-{ target }.tar.gz"
+bin-dir = "warpline-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [[bin]]
 name = "warpline-control"
 path = "src/main.rs"

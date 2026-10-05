@@ -284,6 +284,33 @@ This is the Cloudflare Workers `fetch` policy: full open egress means one
 hostile module can use the fleet to attack a third party, and the
 multi-tenant runtime takes the blame either way.
 
+## Install
+
+Prebuilt binaries (`warpline-host` and `warpline-control`) are attached to
+each [GitHub release](https://github.com/Bunty9/warpline/releases) for
+`x86_64`/`aarch64` Linux (glibc) and `x86_64`/`aarch64` macOS. Not shipped:
+musl, Windows, 32-bit.
+
+```bash
+# cargo-binstall (falls back to a source build if no archive matches)
+cargo binstall warpline-host warpline-control
+
+# or download a tarball and verify it
+v=X.Y.Z; t=x86_64-unknown-linux-gnu
+base=https://github.com/Bunty9/warpline/releases/download/v$v
+curl -fLO $base/warpline-v$v-$t.tar.gz -O $base/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS          # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+gh attestation verify warpline-v$v-$t.tar.gz --repo Bunty9/warpline
+tar xzf warpline-v$v-$t.tar.gz                    # -> warpline-v$v-$t/{warpline-host,warpline-control,...}
+
+# or the container image (linux/amd64 and linux/arm64, distroless, non-root)
+docker pull ghcr.io/bunty9/warpline:X.Y.Z
+```
+
+`cargo install warpline-host warpline-control` builds from source.
+Binstall resolves archives only for releases published with the metadata
+(0.2.1 and later).
+
 ## Quickstart
 
 ```bash
@@ -566,11 +593,21 @@ Releases go through a PR merged to `main`, then a tag on `main`.
    update the compare links at the bottom.
 4. Merge the PR, then `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
 
-The `release` workflow checks that the tag matches the version, runs
-`cargo package --workspace --locked`, publishes the crates not yet on
-crates.io through trusted publishing (no stored token; safe to re-run after a
-partial failure) and creates the GitHub release from the changelog section.
-See `docs/plans/2026-09-28-publishing.md`.
+The `release` workflow (`.github/workflows/release.yml`) runs these jobs
+in order: `preflight` (tag equals the version, tag is on `main`, changelog
+section exists, `cargo package --workspace --locked`), `build` (four targets:
+`x86_64`/`aarch64` Linux and macOS, as `warpline-vX.Y.Z-<target>.tar.gz`),
+`publish` (crates not yet on crates.io, through trusted publishing; no stored
+token; safe to re-run after a partial failure), `release` (draft GitHub
+release from the changelog section, archives and `SHA256SUMS` uploaded with
+provenance attestations, then published) and `docker` (multi-arch image
+`ghcr.io/bunty9/warpline` from the release's Linux binaries). Nothing is
+published unless every target built.
+
+To exercise the build matrix before tagging, run the workflow manually
+(Actions, `release`, Run workflow, branch of your choice). A manual run builds
+and uploads the four archives as workflow artifacts and never publishes
+anything. See `docs/plans/2026-09-28-publishing.md`.
 
 ## License <a id="license"></a>
 

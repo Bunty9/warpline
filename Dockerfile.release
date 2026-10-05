@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+
+# Release image: copies the prebuilt Linux binaries from the release archives
+# (see the `docker` job in .github/workflows/release.yml, which stages the
+# build context as ctx/linux-{amd64,arm64}/ and ctx/rootfs/). Not for local
+# source builds; use the root Dockerfile for those.
+#
+# NOT scratch: wasmtime links libc + libgcc_s. Distroless `cc` ships both,
+# plus ca-certs.
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG TARGETARCH
+WORKDIR /app
+COPY linux-${TARGETARCH}/warpline-host /usr/local/bin/warpline-host
+COPY linux-${TARGETARCH}/warpline-control /usr/local/bin/warpline-control
+# Modules dir owned by distroless `nonroot` (65532) so a fresh named volume
+# inherits a writable directory.
+COPY --chown=65532:65532 rootfs/var/lib/warpline /var/lib/warpline
+EXPOSE 8080 8081
+ENTRYPOINT ["/usr/local/bin/warpline-host"]
