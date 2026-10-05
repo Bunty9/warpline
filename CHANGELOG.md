@@ -21,6 +21,13 @@ break).
 - `release` workflow can be run manually as a dry run that builds the
   archives without publishing.
 
+### Security
+
+- Bump wasmtime and wasmtime-wasi to 49.0.2, fixing RUSTSEC-2026-0321,
+  RUSTSEC-2026-0322, RUSTSEC-2026-0323, RUSTSEC-2026-0324,
+  RUSTSEC-2026-0325, RUSTSEC-2026-0326 and RUSTSEC-2026-0327 (including a
+  stack buffer overflow on the async-lifted component callback).
+
 ## [0.2.0] - 2026-09-30
 
 warpline-core is now embeddable: hold a `Runtime`, publish components and
