@@ -7,6 +7,8 @@ break).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-05
+
 ### Added
 
 - Prebuilt binaries on each GitHub release: `warpline-host` and
@@ -148,6 +150,7 @@ First release.
   fixture reproducibility.
 - crates.io metadata and dual MIT/Apache-2.0 licensing.
 
-[Unreleased]: https://github.com/Bunty9/warpline/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Bunty9/warpline/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Bunty9/warpline/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Bunty9/warpline/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bunty9/warpline/releases/tag/v0.1.0

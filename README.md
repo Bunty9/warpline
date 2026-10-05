@@ -301,6 +301,7 @@ base=https://github.com/Bunty9/warpline/releases/download/v$v
 curl -fLO $base/warpline-v$v-$t.tar.gz -O $base/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS          # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
 gh attestation verify warpline-v$v-$t.tar.gz --repo Bunty9/warpline
+gh attestation verify oci://ghcr.io/bunty9/warpline:$v --repo Bunty9/warpline
 tar xzf warpline-v$v-$t.tar.gz                    # -> warpline-v$v-$t/{warpline-host,warpline-control,...}
 
 # or the container image (linux/amd64 and linux/arm64, distroless, non-root)

@@ -100,6 +100,8 @@ jobs:
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
+          # BSD tar on macOS: keep AppleDouble/xattr entries out of the archive.
+          COPYFILE_DISABLE: "1"
         run: cargo build --release --locked -p warpline-host -p warpline-control --target "$TARGET"
       # Layout: warpline-v<version>-<target>/{warpline-host,warpline-control,
       # LICENSE-*,README.md}; keep in sync with `bin-dir` in
@@ -108,6 +110,8 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           TARGET: ${{ matrix.target }}
+          # BSD tar on macOS: keep AppleDouble/xattr entries out of the archive.
+          COPYFILE_DISABLE: "1"
         run: |
           d="warpline-v$VERSION-$TARGET"
           mkdir -p "dist/$d"
