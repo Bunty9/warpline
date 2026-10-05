@@ -49,7 +49,7 @@ wasmtime-wasi = { version = "49", default-features = false, features = ["p2"] }
 async-trait = "0.1"
 
 # `.cwasm` cache key — content-hash the source wasm bytes.
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Outbound HTTP for the host-side `http-out` capability.
