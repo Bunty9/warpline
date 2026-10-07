@@ -67,7 +67,7 @@ jobs:
           [ -s "$RUNNER_TEMP/notes.md" ] || { echo "no CHANGELOG.md section for ${TAG#v}" >&2; exit 1; }
       - name: cargo package --workspace
         run: cargo package --workspace --locked
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'push'
         with:
           name: notes
@@ -124,7 +124,7 @@ jobs:
             tar -xzOf "dist/$d.tar.gz" "$d/warpline-host" > "$RUNNER_TEMP/h"
             objdump -T "$RUNNER_TEMP/h" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
           fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
           path: dist/*.tar.gz
